@@ -1,0 +1,34 @@
+models:
+  targets:
+    bedrock_default:
+      provider: bedrock
+      model_id: ${DEFAULT_MODEL_ID:-global.anthropic.claude-sonnet-4-6}
+      region: ${AWS_REGION:-us-east-1}
+      temperature: 0.2
+      max_tokens: 4096
+      timeout_seconds: 90
+      max_attempts: 2
+    anthropic_direct:
+      provider: anthropic
+      model_id: ${ANTHROPIC_MODEL_ID:-claude-sonnet-4-6}
+      temperature: 0.2
+      max_tokens: 4096
+      timeout_seconds: 90
+      max_attempts: 2
+      required_env: ANTHROPIC_API_KEY
+    openai_direct:
+      provider: openai
+      model_id: ${OPENAI_MODEL_ID:-gpt-5.4}
+      temperature: 0.2
+      max_tokens: 4096
+      timeout_seconds: 90
+      max_attempts: 2
+      required_env: OPENAI_API_KEY
+  roles:
+    clarifier: [bedrock_default, anthropic_direct, openai_direct]
+    planner: [bedrock_default, anthropic_direct, openai_direct]
+    researcher: [bedrock_default, anthropic_direct, openai_direct]
+    reviewer: [bedrock_default, anthropic_direct, openai_direct]
+    report: [bedrock_default, anthropic_direct, openai_direct]
+    questions: [bedrock_default, anthropic_direct, openai_direct]
+
