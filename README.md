@@ -10,9 +10,13 @@ Implemented so far:
 - a no-tools Planning Agent with validated workstream DAGs and fixed depth ceilings;
 - deterministic plan versions and canonical SHA-256 approval hashes;
 - a no-tools Questions Agent producing report-linked, prioritized follow-up topics;
+- a bounded Evidence Reviewer with source scoring, deterministic coverage checks, targeted repair
+  tasks, budget-aware retry ceilings, and explicit exhausted-budget limitations;
+- a Report Generation Agent with evidence-bound reviews, claim-mapped citation validation,
+  deterministic Markdown assembly and source appendices, checksums, and strict Mermaid degradation;
 - configuration-driven Bedrock, Anthropic, and OpenAI Strands model routing;
 - whole-operation retries and provider fallback without mixing partial outputs;
-- a minimal FastAPI clarification endpoint and health check;
+- FastAPI endpoints for each implemented agent plus a health check;
 - credential-free unit tests using fake structured model responses.
 
 ## Local setup
@@ -37,6 +41,8 @@ API-key environment variables are present.
 POST /v1/clarifier/evaluate
 POST /v1/planner/generate
 POST /v1/questions/generate
+POST /v1/reviewer/review
+POST /v1/report/generate
 ```
 
 The request carries the topic, safe upload metadata, previous answers, current normalized brief,
@@ -47,3 +53,8 @@ The planning endpoint accepts an approved brief, depth preset, upload metadata, 
 optional previous plan. Budget ceilings, version, and content hash are application-controlled. The
 questions endpoint accepts a compact completed-report context and returns five to ten suggestions;
 it never starts a new run.
+
+The reviewer result is bound to hashes of the exact plan and evidence package. Repair tasks cannot
+exceed the plan's remaining query or retry budget. The report endpoint accepts only a non-repair
+review for those same inputs, rejects invented or unmapped citations, and omits unsafe Mermaid after
+one repair attempt while retaining a prose fallback.

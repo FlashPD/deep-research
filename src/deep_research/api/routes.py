@@ -5,9 +5,13 @@ from fastapi import APIRouter, Depends, Request
 from deep_research.agents.clarifier import ClarifierAgent
 from deep_research.agents.planner import PlanningAgent
 from deep_research.agents.questions import QuestionsAgent
+from deep_research.agents.report import ReportGenerationAgent
+from deep_research.agents.reviewer import EvidenceReviewer
 from deep_research.contracts.clarification import ClarificationDecision, ClarifierRequest
+from deep_research.contracts.evidence import ReviewerRequest, ReviewResult
 from deep_research.contracts.planning import PlannerRequest, ResearchPlan
 from deep_research.contracts.questions import FollowUpQuestionSet, QuestionsRequest
+from deep_research.contracts.reporting import ReportArtifact, ReportRequest
 
 router = APIRouter(prefix="/v1")
 
@@ -22,6 +26,14 @@ def _get_planner(request: Request) -> PlanningAgent:
 
 def _get_questions_agent(request: Request) -> QuestionsAgent:
     return request.app.state.questions
+
+
+def _get_reviewer(request: Request) -> EvidenceReviewer:
+    return request.app.state.reviewer
+
+
+def _get_report_agent(request: Request) -> ReportGenerationAgent:
+    return request.app.state.report
 
 
 @router.get("/health")
@@ -51,3 +63,19 @@ async def generate_questions(
     questions_agent: Annotated[QuestionsAgent, Depends(_get_questions_agent)],
 ) -> FollowUpQuestionSet:
     return await questions_agent.generate(payload)
+
+
+@router.post("/reviewer/review", response_model=ReviewResult)
+async def review_evidence(
+    payload: ReviewerRequest,
+    reviewer: Annotated[EvidenceReviewer, Depends(_get_reviewer)],
+) -> ReviewResult:
+    return await reviewer.review(payload)
+
+
+@router.post("/report/generate", response_model=ReportArtifact)
+async def generate_report(
+    payload: ReportRequest,
+    report_agent: Annotated[ReportGenerationAgent, Depends(_get_report_agent)],
+) -> ReportArtifact:
+    return await report_agent.generate(payload)
