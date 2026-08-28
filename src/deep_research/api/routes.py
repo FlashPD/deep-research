@@ -6,12 +6,14 @@ from deep_research.agents.clarifier import ClarifierAgent
 from deep_research.agents.planner import PlanningAgent
 from deep_research.agents.questions import QuestionsAgent
 from deep_research.agents.report import ReportGenerationAgent
+from deep_research.agents.researcher import ResearchAgent
 from deep_research.agents.reviewer import EvidenceReviewer
 from deep_research.contracts.clarification import ClarificationDecision, ClarifierRequest
 from deep_research.contracts.evidence import ReviewerRequest, ReviewResult
 from deep_research.contracts.planning import PlannerRequest, ResearchPlan
 from deep_research.contracts.questions import FollowUpQuestionSet, QuestionsRequest
 from deep_research.contracts.reporting import ReportArtifact, ReportRequest
+from deep_research.contracts.research import ResearchRequest, ResearchResult
 
 router = APIRouter(prefix="/v1")
 
@@ -34,6 +36,10 @@ def _get_reviewer(request: Request) -> EvidenceReviewer:
 
 def _get_report_agent(request: Request) -> ReportGenerationAgent:
     return request.app.state.report
+
+
+def _get_research_agent(request: Request) -> ResearchAgent:
+    return request.app.state.researcher
 
 
 @router.get("/health")
@@ -79,3 +85,11 @@ async def generate_report(
     report_agent: Annotated[ReportGenerationAgent, Depends(_get_report_agent)],
 ) -> ReportArtifact:
     return await report_agent.generate(payload)
+
+
+@router.post("/researcher/research", response_model=ResearchResult)
+async def conduct_research(
+    payload: ResearchRequest,
+    researcher: Annotated[ResearchAgent, Depends(_get_research_agent)],
+) -> ResearchResult:
+    return await researcher.research(payload)
