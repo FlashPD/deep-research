@@ -18,7 +18,12 @@ Implemented so far:
   deterministic Markdown assembly and source appendices, checksums, and strict Mermaid degradation;
 - configuration-driven Bedrock, Anthropic, and OpenAI Strands model routing;
 - whole-operation retries and provider fallback without mixing partial outputs;
-- FastAPI endpoints for each implemented agent plus a health check;
+- an authenticated run control plane with validated lifecycle transitions, exact plan approval,
+  idempotent commands, optimistic concurrency, cancellation, budgets, and replayable events;
+- tenant/owner-aware in-memory and DynamoDB repositories with 30-day TTL metadata;
+- Cognito access-token verification with cached JWKS, issuer, signature, app-client, token-use,
+  expiry, identity, and scope checks;
+- FastAPI endpoints for each implemented agent, run commands, event replay, and a health check;
 - credential-free unit tests using fake structured model responses.
 
 ## Local setup
@@ -34,6 +39,11 @@ pytest
 uvicorn deep_research.api.app:app --reload
 ```
 
+Local setup defaults to `AUTH_MODE=development`, which injects a fixed local identity and must not
+be used in a shared or production deployment. Set `AUTH_MODE=cognito`, `COGNITO_ISSUER`, and
+`COGNITO_CLIENT_ID` to require Cognito bearer access tokens. The API always derives owner and tenant
+identity from the authenticated principal; run requests cannot supply either value.
+
 Model routes live in [`config/models.yaml`](config/models.yaml). Bedrock uses the normal AWS
 credential chain. Direct Anthropic and OpenAI fallbacks become eligible only when their respective
 API-key environment variables are present.
@@ -48,6 +58,32 @@ POST /v1/questions/generate
 POST /v1/reviewer/review
 POST /v1/report/generate
 ```
+
+## Run control plane
+
+```text
+POST /v1/runs
+GET  /v1/runs/{run_id}
+POST /v1/runs/{run_id}/start
+POST /v1/runs/{run_id}/clarifications
+PUT  /v1/runs/{run_id}/plan
+POST /v1/runs/{run_id}/plan/approve
+POST /v1/runs/{run_id}/cancel
+GET  /v1/runs/{run_id}/events?after={cursor}
+```
+
+Every mutating request requires an `Idempotency-Key` header of 8–200 characters. Reusing a key for
+the same command returns the original response; reusing it for different input returns `409`.
+Plan approval requires the exact current plan version and canonical SHA-256 hash. Lifecycle updates
+atomically persist the new run revision, one immutable ordered event, and the idempotency response.
+Event polling accepts a cursor so clients can reconnect without losing progress. Live SSE delivery
+and durable worker dispatch belong to the graph/worker layer that consumes this control plane.
+
+Without `DYNAMODB_RUNS_TABLE`, runs use process-local memory for development and tests. When the
+table is configured, the repository uses one DynamoDB table with string partition/sort keys named
+`PK` and `SK`, plus a numeric `expires_at` TTL attribute. Enable DynamoDB TTL on `expires_at`.
+Conditional transactional writes enforce revision and event ordering. The application does not
+create the table; infrastructure remains the CDK layer's responsibility.
 
 The request carries the topic, safe upload metadata, previous answers, current normalized brief,
 and clarification round. The response is always a validated `ClarificationDecision`; the endpoint
@@ -68,7 +104,7 @@ one repair attempt while retaining a prose fallback.
 `ResearchAgent` never receives credentials, tenant IDs, index clients, or browser sessions from the
 model. A run-bound `ResearchAdapter` supplies three typed capabilities: `search_web`, `fetch_page`,
 and `search_uploads`. The default API application adapter remains deliberately unconfigured because
-the API foundation does not yet authenticate and resolve a run owner. A durable worker should call
+research execution belongs in a durable worker, not the API request process. That worker should call
 `build_live_research_services(settings, tenant_id=..., run_id=...)` only after ownership and exact
 plan approval have been verified.
 
@@ -85,8 +121,8 @@ are combined with `merge_research_results` before constructing a `ReviewerReques
 ## Upload ingestion and retrieval
 
 `UploadIngestionService` is the post-upload processing boundary. The browser-facing presigned-upload
-API is intentionally not exposed yet because authentication, run persistence, S3, and quarantine
-events have not been implemented. Once an authenticated API or worker has the bytes, ingestion is:
+API is intentionally not exposed yet because the S3 upload authorization and quarantine-event
+workflow are not implemented. Once an authenticated API or worker has the bytes, ingestion is:
 
 1. Write the original into a tenant/run-scoped quarantine location.
 2. Enforce the 25 MB limit and validate extension, declared MIME type, and magic/archive structure.

@@ -1,5 +1,6 @@
 from functools import lru_cache
 from pathlib import Path
+from typing import Literal
 
 from pydantic import SecretStr
 from pydantic_settings import BaseSettings, SettingsConfigDict
@@ -24,9 +25,22 @@ class AppSettings(BaseSettings):
     upload_artifact_root: Path = Path(".data/uploads")
     clamav_host: str = "localhost"
     clamav_port: int = 3310
+    auth_mode: Literal["development", "cognito"] = "development"
+    cognito_issuer: str | None = None
+    cognito_client_id: str | None = None
+    cognito_required_scopes: str = "research:run"
+    cognito_tenant_claim: str = "custom:tenant_id"
+    cognito_jwks_cache_seconds: int = 3_600
+    run_retention_days: int = 30
+    dynamodb_runs_table: str | None = None
+    aws_region: str = "us-east-1"
 
     def load_models(self) -> ModelSettings:
         return ModelSettings.from_yaml(self.model_config_path)
+
+    @property
+    def required_scopes(self) -> frozenset[str]:
+        return frozenset(self.cognito_required_scopes.split())
 
 
 @lru_cache
