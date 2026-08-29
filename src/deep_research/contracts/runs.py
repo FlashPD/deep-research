@@ -4,7 +4,7 @@ from typing import Annotated, Any, Self
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
-from deep_research.contracts.clarification import ResearchBrief
+from deep_research.contracts.clarification import ClarificationAnswer, ResearchBrief
 from deep_research.contracts.evidence import BudgetUsage
 from deep_research.contracts.orchestration import GraphCheckpoint
 from deep_research.contracts.planning import DepthPreset, ResearchPlan
@@ -103,11 +103,18 @@ class PlanApprovalRequest(BaseModel):
     content_hash: Annotated[str, Field(pattern=r"^[a-f0-9]{64}$")]
 
 
-class ClarificationUpdate(BaseModel):
+class ClarificationAnswerRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
-    brief: ResearchBrief
-    scope_ready: bool
+    round_number: int = Field(ge=1, le=3)
+    answers: list[ClarificationAnswer] = Field(default_factory=list, max_length=5)
+
+    @model_validator(mode="after")
+    def validate_unique_questions(self) -> Self:
+        question_ids = [answer.question_id for answer in self.answers]
+        if len(question_ids) != len(set(question_ids)):
+            raise ValueError("each clarification question may be answered only once")
+        return self
 
 
 class FailureUpdate(BaseModel):

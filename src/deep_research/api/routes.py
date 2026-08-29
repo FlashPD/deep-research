@@ -1,6 +1,7 @@
 from typing import Annotated
 
 from fastapi import APIRouter, Depends, Header, Query, Request
+from fastapi.responses import PlainTextResponse
 
 from deep_research.agents.clarifier import ClarifierAgent
 from deep_research.agents.planner import PlanningAgent
@@ -16,7 +17,7 @@ from deep_research.contracts.questions import FollowUpQuestionSet, QuestionsRequ
 from deep_research.contracts.reporting import ReportArtifact, ReportRequest
 from deep_research.contracts.research import ResearchRequest, ResearchResult
 from deep_research.contracts.runs import (
-    ClarificationUpdate,
+    ClarificationAnswerRequest,
     CreateRunRequest,
     PlanApprovalRequest,
     Principal,
@@ -159,22 +160,20 @@ async def start_run(
 @router.post("/runs/{run_id}/clarifications", response_model=ResearchRun)
 async def update_clarification(
     run_id: str,
-    payload: ClarificationUpdate,
+    payload: ClarificationAnswerRequest,
     idempotency_key: IdempotencyKey,
     principal: Annotated[Principal, Depends(_get_principal)],
     service: Annotated[RunControlService, Depends(_get_run_control)],
     dispatcher: Annotated[JobDispatcher, Depends(_get_job_dispatcher)],
 ) -> ResearchRun:
-    run = await service.record_clarification(
+    run = await service.submit_clarification_answers(
         principal,
         run_id,
-        payload.brief,
-        scope_ready=payload.scope_ready,
+        payload.answers,
+        round_number=payload.round_number,
         idempotency_key=idempotency_key,
     )
-    await dispatcher.dispatch(
-        make_phase_job(run, JobPhase.PLAN if run.state.value == "PLANNING" else JobPhase.CLARIFY)
-    )
+    await dispatcher.dispatch(make_phase_job(run, JobPhase.CLARIFY))
     return run
 
 
@@ -222,3 +221,17 @@ async def get_run_events(
     limit: Annotated[int, Query(ge=1, le=100)] = 100,
 ) -> RunEventPage:
     return await service.get_events(principal, run_id, after_cursor=after, limit=limit)
+
+
+@router.get(
+    "/runs/{run_id}/report",
+    response_class=PlainTextResponse,
+    responses={409: {"description": "Report not ready"}},
+)
+async def get_run_report(
+    run_id: str,
+    principal: Annotated[Principal, Depends(_get_principal)],
+    service: Annotated[RunControlService, Depends(_get_run_control)],
+) -> PlainTextResponse:
+    markdown = await service.get_report(principal, run_id)
+    return PlainTextResponse(markdown, media_type="text/markdown; charset=utf-8")

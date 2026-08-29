@@ -27,10 +27,11 @@ def create_worker(
     gateway: StructuredModelGateway | None = None,
     run_repository: RunRepository | None = None,
     job_dispatcher: JobDispatcher | None = None,
+    run_control: RunControlService | None = None,
 ) -> DurableWorker:
     """Compose a worker; injected local adapters can be shared with the API in tests/dev."""
     configured = settings or get_settings()
-    model_gateway = gateway or ModelGateway(configured.load_models())
+    model_gateway = gateway or ModelGateway(configured.validate_model_credentials())
     repository = run_repository or _build_repository(configured)
     dispatcher = job_dispatcher or _build_dispatcher(configured)
 
@@ -43,7 +44,7 @@ def create_worker(
         return ResearchAgent(model_gateway, services.research_adapter)
 
     return DurableWorker(
-        RunControlService(repository, retention_days=configured.run_retention_days),
+        run_control or RunControlService(repository, retention_days=configured.run_retention_days),
         dispatcher,
         WorkerAgents(
             clarifier=ClarifierAgent(model_gateway),

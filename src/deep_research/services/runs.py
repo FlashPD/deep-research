@@ -5,7 +5,12 @@ from collections.abc import Callable
 from datetime import UTC, datetime, timedelta
 from typing import Any
 
-from deep_research.contracts.clarification import ResearchBrief
+from deep_research.contracts.clarification import (
+    AnswerType,
+    ClarificationAnswer,
+    ClarificationQuestion,
+    ResearchBrief,
+)
 from deep_research.contracts.evidence import BudgetUsage
 from deep_research.contracts.orchestration import GraphCheckpoint, GraphNode
 from deep_research.contracts.planning import ResearchPlan
@@ -51,6 +56,10 @@ class StalePlanApprovalError(RunCommandConflictError):
 
 
 class IdempotencyConflictError(RunCommandConflictError):
+    pass
+
+
+class ReportNotReadyError(RunCommandConflictError):
     pass
 
 
@@ -163,6 +172,66 @@ class RunControlService:
             },
         )
         return await self._commit(principal, current, updated, event, idempotency_key, fingerprint)
+
+    async def submit_clarification_answers(
+        self,
+        principal: Principal,
+        run_id: str,
+        answers: list[ClarificationAnswer],
+        *,
+        round_number: int,
+        idempotency_key: str,
+    ) -> ResearchRun:
+        payload = {
+            "run_id": run_id,
+            "round_number": round_number,
+            "answers": [answer.model_dump(mode="json") for answer in answers],
+        }
+        fingerprint = _fingerprint("submit_clarification_answers", payload)
+        if replay := await self._replay(principal, idempotency_key, fingerprint):
+            return replay
+        current = await self._repository.get(principal, run_id)
+        if current.state is not RunState.CLARIFYING:
+            raise InvalidRunTransitionError("run is not awaiting clarification answers")
+        checkpoint = current.graph_checkpoint
+        if round_number != checkpoint.clarification_round:
+            raise RunCommandConflictError("clarification answers refer to a stale round")
+        pending = {item.id: item for item in checkpoint.pending_clarification_questions}
+        if not pending:
+            raise RunCommandConflictError("run has no pending clarification questions")
+        if checkpoint.submitted_clarification_answers:
+            raise RunCommandConflictError("answers were already submitted for this round")
+        answer_ids = [answer.question_id for answer in answers]
+        if len(answer_ids) != len(set(answer_ids)):
+            raise RunCommandConflictError("duplicate answers for the same question are not allowed")
+        unknown = set(answer_ids) - set(pending)
+        if unknown:
+            raise RunCommandConflictError(
+                f"answers reference unknown or stale questions: {sorted(unknown)}"
+            )
+        missing = {item.id for item in pending.values() if item.required} - set(answer_ids)
+        if missing:
+            raise RunCommandConflictError(
+                f"required clarification answers are missing: {sorted(missing)}"
+            )
+        for answer in answers:
+            _validate_clarification_answer(answer, pending[answer.question_id])
+        next_checkpoint = checkpoint.model_copy(
+            update={
+                "submitted_clarification_answers": answers,
+                "clarification_answers": [*checkpoint.clarification_answers, *answers],
+            }
+        )
+        updated, event = self._mutation(
+            current,
+            state=RunState.CLARIFYING,
+            event_type="clarification.answers_submitted",
+            event_payload={"round_number": round_number, "answer_count": len(answers)},
+            extra={"graph_checkpoint": next_checkpoint},
+        )
+        return await self._commit(
+            principal, current, updated, event, idempotency_key, fingerprint
+        )
 
     async def save_plan(
         self,
@@ -446,6 +515,12 @@ class RunControlService:
         next_cursor = events[-1].cursor if events else after_cursor
         return RunEventPage(events=events, next_cursor=next_cursor)
 
+    async def get_report(self, principal: Principal, run_id: str) -> str:
+        run = await self._repository.get(principal, run_id)
+        if run.state is not RunState.COMPLETED or run.graph_checkpoint.report is None:
+            raise ReportNotReadyError("the completed report is not ready")
+        return run.graph_checkpoint.report.markdown
+
     async def _change_state(
         self,
         principal: Principal,
@@ -573,6 +648,31 @@ def _validate_monotonic_budget(current: BudgetUsage, updated: BudgetUsage) -> No
     for field in type(current).model_fields:
         if getattr(updated, field) < getattr(current, field):
             raise RunCommandConflictError(f"budget field {field!r} cannot decrease")
+
+
+def _validate_clarification_answer(
+    answer: ClarificationAnswer, question: ClarificationQuestion
+) -> None:
+    value = answer.value
+    kind = question.expected_answer_type
+    valid = False
+    if kind in {AnswerType.TEXT, AnswerType.DATE_RANGE}:
+        valid = isinstance(value, str) and bool(value.strip())
+    elif kind is AnswerType.CONFIRMATION:
+        valid = isinstance(value, bool)
+    elif kind is AnswerType.SINGLE_SELECT:
+        valid = isinstance(value, str) and value in question.options
+    elif kind is AnswerType.MULTI_SELECT:
+        valid = (
+            isinstance(value, list)
+            and bool(value)
+            and len(value) == len(set(value))
+            and all(item in question.options for item in value)
+        )
+    if not valid:
+        raise RunCommandConflictError(
+            f"answer for question {question.id!r} does not match its expected type"
+        )
 
 
 def _validate_safe_event_payload(payload: dict[str, Any]) -> None:

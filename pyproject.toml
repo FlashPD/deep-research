@@ -32,15 +32,20 @@ dev = [
 ]
 
 [project.scripts]
+deep-research-dev = "deep_research.dev_app:main"
+deep-research-run = "deep_research.cli:main"
 deep-research-worker = "deep_research.worker_app:main"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/deep_research"]
 
 [tool.pytest.ini_options]
-addopts = "-q"
+addopts = "-q -m 'not live'"
 testpaths = ["tests"]
 asyncio_mode = "auto"
+markers = [
+  "live: opt-in tests that call configured model, Tavily, and public-web services",
+]
 
 [tool.ruff]
 target-version = "py313"
