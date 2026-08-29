@@ -1,5 +1,6 @@
+import asyncio
 from collections.abc import AsyncIterator
-from contextlib import asynccontextmanager
+from contextlib import asynccontextmanager, suppress
 
 from fastapi import FastAPI
 from fastapi.responses import JSONResponse
@@ -33,6 +34,7 @@ from deep_research.services.runs import (
 )
 from deep_research.settings import get_settings
 from deep_research.tools.research import ResearchAdapter, UnconfiguredResearchAdapter
+from deep_research.worker import DurableWorker
 
 
 def create_app(
@@ -41,6 +43,8 @@ def create_app(
     run_repository: RunRepository | None = None,
     authenticator: RequestAuthenticator | None = None,
     job_dispatcher: JobDispatcher | None = None,
+    run_control: RunControlService | None = None,
+    background_worker: DurableWorker | None = None,
     expose_agent_debug_routes: bool | None = None,
 ) -> FastAPI:
     @asynccontextmanager
@@ -57,13 +61,24 @@ def create_app(
                 configured_gateway, research_adapter or UnconfiguredResearchAdapter()
             )
         configured_repository = run_repository or _build_run_repository(settings)
-        app.state.run_control = RunControlService(
-            configured_repository,
-            retention_days=settings.run_retention_days,
+        app.state.run_control = run_control or RunControlService(
+            configured_repository, retention_days=settings.run_retention_days
         )
         app.state.authenticator = authenticator or build_authenticator(settings)
         app.state.job_dispatcher = job_dispatcher or _build_job_dispatcher(settings)
-        yield
+        app.state.background_worker = background_worker
+        worker_task: asyncio.Task[None] | None = None
+        if background_worker is not None:
+            worker_task = asyncio.create_task(
+                background_worker.run_forever(), name="deep-research-local-worker"
+            )
+        try:
+            yield
+        finally:
+            if worker_task is not None:
+                worker_task.cancel()
+                with suppress(asyncio.CancelledError):
+                    await worker_task
 
     app = FastAPI(title="Deep Research API", version="0.1.0", lifespan=lifespan)
     app.state.expose_agent_debug_routes = (

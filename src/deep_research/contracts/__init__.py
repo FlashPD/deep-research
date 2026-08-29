@@ -70,7 +70,7 @@ from deep_research.contracts.research import (
     WebSearchResult,
 )
 from deep_research.contracts.runs import (
-    ClarificationUpdate,
+    ClarificationAnswerRequest,
     CreateRunRequest,
     FailureUpdate,
     PlanApprovalRequest,
@@ -87,7 +87,7 @@ __all__ = [
     "ClarificationAnswer",
     "ClarificationDecision",
     "ClarificationQuestion",
-    "ClarificationUpdate",
+    "ClarificationAnswerRequest",
     "ClarifierRequest",
     "ResearchBrief",
     "UploadMetadata",

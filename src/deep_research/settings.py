@@ -5,7 +5,7 @@ from typing import Literal
 from pydantic import SecretStr
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
-from deep_research.models.config import ModelSettings
+from deep_research.models.config import ModelProvider, ModelSettings
 
 
 class AppSettings(BaseSettings):
@@ -13,6 +13,10 @@ class AppSettings(BaseSettings):
 
     app_name: str = "Deep Research API"
     model_config_path: Path = Path("config/models.yaml")
+    model_provider: ModelProvider = ModelProvider.BEDROCK
+    model_fallback_order: str = ""
+    openai_api_key: SecretStr | None = None
+    anthropic_api_key: SecretStr | None = None
     tavily_api_key: SecretStr | None = None
     tavily_base_url: str = "https://api.tavily.com"
     playwright_headless: bool = True
@@ -25,6 +29,7 @@ class AppSettings(BaseSettings):
     upload_artifact_root: Path = Path(".data/uploads")
     clamav_host: str = "localhost"
     clamav_port: int = 3310
+    uploads_enabled: bool = False
     auth_mode: Literal["development", "cognito"] = "development"
     cognito_issuer: str | None = None
     cognito_client_id: str | None = None
@@ -37,7 +42,39 @@ class AppSettings(BaseSettings):
     aws_region: str = "us-east-1"
 
     def load_models(self) -> ModelSettings:
-        return ModelSettings.from_yaml(self.model_config_path)
+        configured = ModelSettings.from_yaml(self.model_config_path)
+        fallbacks = [
+            ModelProvider(item.strip())
+            for item in self.model_fallback_order.split(",")
+            if item.strip()
+        ]
+        return configured.select_provider(
+            self.model_provider,
+            fallback_order=fallbacks,
+            api_keys={
+                ModelProvider.OPENAI: self.openai_api_key,
+                ModelProvider.ANTHROPIC: self.anthropic_api_key,
+            },
+        )
+
+    def validate_model_credentials(self) -> ModelSettings:
+        models = self.load_models()
+        selected = self.model_provider
+        if selected is ModelProvider.OPENAI and not _secret_is_set(self.openai_api_key):
+            raise ValueError("MODEL_PROVIDER=openai requires OPENAI_API_KEY")
+        if selected is ModelProvider.ANTHROPIC and not _secret_is_set(self.anthropic_api_key):
+            raise ValueError("MODEL_PROVIDER=anthropic requires ANTHROPIC_API_KEY")
+        if selected is ModelProvider.BEDROCK:
+            import boto3
+
+            if boto3.Session(region_name=self.aws_region).get_credentials() is None:
+                raise ValueError(
+                    "MODEL_PROVIDER=bedrock requires credentials in the standard AWS "
+                    "credential chain"
+                )
+        for role in models.roles:
+            models.route_for(role)
+        return models
 
     @property
     def required_scopes(self) -> frozenset[str]:
@@ -47,3 +84,7 @@ class AppSettings(BaseSettings):
 @lru_cache
 def get_settings() -> AppSettings:
     return AppSettings()
+
+
+def _secret_is_set(value: SecretStr | None) -> bool:
+    return value is not None and bool(value.get_secret_value().strip())

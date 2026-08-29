@@ -30,7 +30,7 @@ from deep_research.contracts.research import (
     WebSearchResult,
 )
 from deep_research.models.gateway import StructuredModelGateway
-from deep_research.tools.research import ResearchAdapter
+from deep_research.tools.research import ResearchAdapter, ResearchServiceConfigurationError
 
 RESEARCH_PLAN_PROMPT_VERSION = "research-plan-v1"
 RESEARCH_SYNTHESIS_PROMPT_VERSION = "research-synthesis-v1"
@@ -83,6 +83,13 @@ class ResearchAgent:
         *,
         cancellation_check: CancellationCheck | None = None,
     ) -> ResearchResult:
+        if (
+            ResearchTool.SEARCH_UPLOADS in request.task.permitted_tools
+            and not getattr(self._adapter, "supports_upload_search", True)
+        ):
+            raise ResearchServiceConfigurationError(
+                "the approved workstream requires upload search, but UPLOADS_ENABLED is false"
+            )
         await check_cancellation(cancellation_check)
         execution_plan, planning_calls = await self._plan_operations(
             request, cancellation_check=cancellation_check
@@ -318,6 +325,8 @@ class ResearchAgent:
             results = await asyncio.wait_for(
                 self._adapter.search_uploads(operation), timeout=timeout_seconds
             )
+        except ResearchServiceConfigurationError:
+            raise
         except Exception as exc:
             return [], f"Upload search failed: {type(exc).__name__}."
         await check_cancellation(cancellation_check)

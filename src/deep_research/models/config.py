@@ -5,7 +5,7 @@ from pathlib import Path
 from typing import Any
 
 import yaml
-from pydantic import BaseModel, ConfigDict, Field, model_validator
+from pydantic import BaseModel, ConfigDict, Field, SecretStr, model_validator
 
 
 class ModelProvider(StrEnum):
@@ -26,10 +26,18 @@ class ModelTarget(BaseModel):
     region: str | None = None
     base_url: str | None = None
     required_env: str | None = None
+    api_key: SecretStr | None = Field(default=None, exclude=True, repr=False)
 
     @property
     def is_available(self) -> bool:
-        return self.required_env is None or bool(os.getenv(self.required_env))
+        return (
+            self.required_env is None
+            or (
+                self.api_key is not None
+                and bool(self.api_key.get_secret_value().strip())
+            )
+            or bool(os.getenv(self.required_env))
+        )
 
 
 class ModelSettings(BaseModel):
@@ -70,6 +78,38 @@ class ModelSettings(BaseModel):
         if not available:
             raise ValueError(f"no available model targets configured for role {role!r}")
         return available
+
+    def select_provider(
+        self,
+        provider: ModelProvider,
+        *,
+        fallback_order: list[ModelProvider] | None = None,
+        api_keys: dict[ModelProvider, SecretStr | None] | None = None,
+    ) -> "ModelSettings":
+        """Select a provider-first route and inject settings-loaded credentials.
+
+        Credentials are deliberately kept out of YAML and model-authored inputs.
+        """
+        order = list(dict.fromkeys([provider, *(fallback_order or [])]))
+        keys = api_keys or {}
+        targets = {
+            name: target.model_copy(update={"api_key": keys.get(target.provider)})
+            for name, target in self.targets.items()
+        }
+        roles: dict[str, list[str]] = {}
+        for role, route in self.roles.items():
+            roles[role] = [
+                name
+                for selected in order
+                for name in route
+                if targets[name].provider is selected
+            ]
+            if not roles[role]:
+                raise ValueError(
+                    f"no model target configured for role {role!r} and providers "
+                    f"{[item.value for item in order]}"
+                )
+        return ModelSettings(targets=targets, roles=roles)
 
 
 _ENV_PATTERN = re.compile(r"\$\{([A-Z][A-Z0-9_]*)(?::-([^}]*))?}")

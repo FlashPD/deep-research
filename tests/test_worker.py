@@ -137,6 +137,10 @@ async def test_complete_mocked_workflow_is_checkpointed_and_finalized() -> None:
     assert completed.state is RunState.COMPLETED
     assert completed.graph_checkpoint.report is not None
     assert completed.graph_checkpoint.questions is not None
+    assert (
+        await control.get_report(principal, run.run_id)
+        == completed.graph_checkpoint.report.markdown
+    )
     assert completed.graph_checkpoint.completed_nodes[-1] is GraphNode.FINALIZE
     assert completed.budget_usage.searches == 1
     assert completed.budget_usage.model_calls == 7

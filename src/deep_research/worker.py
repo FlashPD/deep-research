@@ -44,6 +44,7 @@ from deep_research.services.runs import (
     InvalidRunTransitionError,
     RunControlService,
 )
+from deep_research.tools.research import ResearchServiceConfigurationError
 
 
 class CooperativeCancellation(RuntimeError):
@@ -105,6 +106,9 @@ class DurableWorker:
                 await self._dispatcher.acknowledge(delivery)
             else:
                 await self._dispatcher.retry(delivery)
+        except ResearchServiceConfigurationError as exc:
+            await self._fail_delivery(delivery, "research_service_configuration", exc)
+            await self._dispatcher.acknowledge(delivery)
         except Exception as exc:
             if delivery.delivery_count >= self._max_delivery_attempts:
                 await self._fail_delivery(delivery, "worker_retry_ceiling", exc)
@@ -147,7 +151,8 @@ class DurableWorker:
             self._agents.clarifier.evaluate,
             ClarifierRequest(
                 topic=run.topic,
-                current_brief=run.brief,
+                answers=checkpoint.submitted_clarification_answers,
+                current_brief=checkpoint.current_proposed_brief or run.brief,
                 round_number=min(3, checkpoint.clarification_round + 1),
             ),
             principal,
@@ -158,7 +163,14 @@ class DurableWorker:
             update={
                 "clarification": decision,
                 "clarification_round": min(3, checkpoint.clarification_round + 1),
-                "completed_nodes": _append_node(checkpoint, GraphNode.CLARIFIER),
+                "pending_clarification_questions": decision.questions,
+                "submitted_clarification_answers": [],
+                "current_proposed_brief": decision.brief,
+                "completed_nodes": (
+                    _append_node(checkpoint, GraphNode.CLARIFIER)
+                    if decision.status == "scope_ready"
+                    else checkpoint.completed_nodes
+                ),
             }
         )
         updated = await self._control.record_clarification(
@@ -690,7 +702,14 @@ class DurableWorker:
                 await self._control.fail(
                     principal,
                     job.run_id,
-                    FailureUpdate(code=code, message=type(exc).__name__ if exc else code),
+                    FailureUpdate(
+                        code=code,
+                        message=(
+                            str(exc)
+                            if isinstance(exc, ResearchServiceConfigurationError)
+                            else type(exc).__name__ if exc else code
+                        ),
+                    ),
                     idempotency_key=job.idempotency_key(f"failure-{delivery.delivery_count}"),
                 )
         except Exception:

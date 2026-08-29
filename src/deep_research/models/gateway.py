@@ -1,4 +1,5 @@
 import asyncio
+import logging
 from collections.abc import Callable
 from typing import Any, Protocol, TypeVar
 
@@ -7,6 +8,7 @@ from pydantic import BaseModel
 from deep_research.models.config import ModelProvider, ModelSettings, ModelTarget
 
 OutputT = TypeVar("OutputT", bound=BaseModel)
+logger = logging.getLogger(__name__)
 
 
 class StructuredModelGateway(Protocol):
@@ -52,6 +54,12 @@ class ModelGateway:
     ) -> OutputT:
         failures: list[tuple[str, BaseException]] = []
         for target_name, target in self._settings.route_for(role):
+            logger.info(
+                "model route selected role=%s provider=%s model=%s",
+                role,
+                target.provider.value,
+                target.model_id,
+            )
             for _attempt in range(target.max_attempts):
                 try:
                     return await asyncio.wait_for(
@@ -109,6 +117,8 @@ class ModelGateway:
             from strands.models.openai import OpenAIModel
 
             client_args = {"timeout": target.timeout_seconds, "max_retries": 0}
+            if target.api_key is not None:
+                client_args["api_key"] = target.api_key.get_secret_value()
             if target.base_url:
                 client_args["base_url"] = target.base_url
             return OpenAIModel(
@@ -122,8 +132,11 @@ class ModelGateway:
         if target.provider is ModelProvider.ANTHROPIC:
             from strands.models.anthropic import AnthropicModel
 
+            client_args = {"timeout": target.timeout_seconds, "max_retries": 0}
+            if target.api_key is not None:
+                client_args["api_key"] = target.api_key.get_secret_value()
             return AnthropicModel(
-                client_args={"timeout": target.timeout_seconds, "max_retries": 0},
+                client_args=client_args,
                 model_id=target.model_id,
                 max_tokens=target.max_tokens,
                 params={"temperature": target.temperature},

@@ -22,6 +22,17 @@ class UploadSearchAdapter(Protocol):
     async def search_uploads(self, operation: UploadSearchOperation) -> list[UploadChunk]: ...
 
 
+class ResearchServiceConfigurationError(RuntimeError):
+    """A plan requested a deliberately unavailable research capability."""
+
+
+class UnconfiguredUploadSearchAdapter:
+    async def search_uploads(self, operation: UploadSearchOperation) -> list[UploadChunk]:
+        raise ResearchServiceConfigurationError(
+            "the approved plan requests upload search, but UPLOADS_ENABLED is false"
+        )
+
+
 class ResearchAdapter(WebSearchAdapter, PageFetchAdapter, UploadSearchAdapter, Protocol):
     """Run-bound research capabilities.
 
@@ -48,6 +59,9 @@ class ComposedResearchAdapter:
         self._web_search = web_search
         self._page_fetcher = page_fetcher
         self._upload_search = upload_search
+        self.supports_upload_search = not isinstance(
+            upload_search, UnconfiguredUploadSearchAdapter
+        )
 
     async def search_web(self, operation: WebSearchOperation) -> list[WebSearchResult]:
         return await self._web_search.search_web(operation)
