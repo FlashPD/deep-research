@@ -31,6 +31,9 @@ dev = [
   "ruff>=0.9,<1",
 ]
 
+[project.scripts]
+deep-research-worker = "deep_research.worker_app:main"
+
 [tool.hatch.build.targets.wheel]
 packages = ["src/deep_research"]
 

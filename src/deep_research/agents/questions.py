@@ -1,5 +1,6 @@
 import json
 
+from deep_research.agents.cancellation import CancellationCheck, check_cancellation
 from deep_research.contracts.questions import (
     FollowUpQuestionSet,
     QuestionsRequest,
@@ -28,11 +29,17 @@ class QuestionsAgent:
     def __init__(self, gateway: StructuredModelGateway) -> None:
         self._gateway = gateway
 
-    async def generate(self, request: QuestionsRequest) -> FollowUpQuestionSet:
+    async def generate(
+        self,
+        request: QuestionsRequest,
+        *,
+        cancellation_check: CancellationCheck | None = None,
+    ) -> FollowUpQuestionSet:
         prompt = self._build_prompt(request)
         last_error: ValueError | None = None
 
         for repair_attempt in range(2):
+            await check_cancellation(cancellation_check)
             if last_error is not None:
                 prompt = (
                     f"{prompt}\nThe prior output failed deterministic validation: "
@@ -44,6 +51,7 @@ class QuestionsAgent:
                 output_type=FollowUpQuestionSet,
                 system_prompt=SYSTEM_PROMPT,
             )
+            await check_cancellation(cancellation_check)
             try:
                 self._validate_result(result, request)
                 return FollowUpQuestionSet(

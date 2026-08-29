@@ -1,0 +1,13 @@
+from typing import Protocol
+
+from deep_research.contracts.jobs import JobDelivery, PhaseJob
+
+
+class JobDispatcher(Protocol):
+    async def dispatch(self, job: PhaseJob) -> None: ...
+
+    async def receive(self, *, wait_seconds: int = 20) -> JobDelivery | None: ...
+
+    async def acknowledge(self, delivery: JobDelivery) -> None: ...
+
+    async def retry(self, delivery: JobDelivery, *, delay_seconds: int = 0) -> None: ...

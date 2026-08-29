@@ -33,6 +33,7 @@ class AppSettings(BaseSettings):
     cognito_jwks_cache_seconds: int = 3_600
     run_retention_days: int = 30
     dynamodb_runs_table: str | None = None
+    sqs_jobs_queue_url: str | None = None
     aws_region: str = "us-east-1"
 
     def load_models(self) -> ModelSettings:

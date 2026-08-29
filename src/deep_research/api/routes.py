@@ -10,6 +10,7 @@ from deep_research.agents.researcher import ResearchAgent
 from deep_research.agents.reviewer import EvidenceReviewer
 from deep_research.contracts.clarification import ClarificationDecision, ClarifierRequest
 from deep_research.contracts.evidence import ReviewerRequest, ReviewResult
+from deep_research.contracts.jobs import JobPhase
 from deep_research.contracts.planning import PlannerRequest, ResearchPlan
 from deep_research.contracts.questions import FollowUpQuestionSet, QuestionsRequest
 from deep_research.contracts.reporting import ReportArtifact, ReportRequest
@@ -22,9 +23,12 @@ from deep_research.contracts.runs import (
     ResearchRun,
     RunEventPage,
 )
+from deep_research.jobs.base import JobDispatcher
 from deep_research.services.runs import RunControlService
+from deep_research.worker import make_phase_job
 
 router = APIRouter(prefix="/v1")
+agent_router = APIRouter(prefix="/v1")
 IdempotencyKey = Annotated[
     str,
     Header(alias="Idempotency-Key", min_length=8, max_length=200),
@@ -59,6 +63,10 @@ def _get_run_control(request: Request) -> RunControlService:
     return request.app.state.run_control
 
 
+def _get_job_dispatcher(request: Request) -> JobDispatcher:
+    return request.app.state.job_dispatcher
+
+
 def _get_principal(request: Request) -> Principal:
     return request.state.principal
 
@@ -68,7 +76,7 @@ async def health() -> dict[str, str]:
     return {"status": "ok"}
 
 
-@router.post("/clarifier/evaluate", response_model=ClarificationDecision)
+@agent_router.post("/clarifier/evaluate", response_model=ClarificationDecision)
 async def evaluate_clarification(
     payload: ClarifierRequest,
     clarifier: Annotated[ClarifierAgent, Depends(_get_clarifier)],
@@ -76,7 +84,7 @@ async def evaluate_clarification(
     return await clarifier.evaluate(payload)
 
 
-@router.post("/planner/generate", response_model=ResearchPlan)
+@agent_router.post("/planner/generate", response_model=ResearchPlan)
 async def generate_plan(
     payload: PlannerRequest,
     planner: Annotated[PlanningAgent, Depends(_get_planner)],
@@ -84,7 +92,7 @@ async def generate_plan(
     return await planner.create_plan(payload)
 
 
-@router.post("/questions/generate", response_model=FollowUpQuestionSet)
+@agent_router.post("/questions/generate", response_model=FollowUpQuestionSet)
 async def generate_questions(
     payload: QuestionsRequest,
     questions_agent: Annotated[QuestionsAgent, Depends(_get_questions_agent)],
@@ -92,7 +100,7 @@ async def generate_questions(
     return await questions_agent.generate(payload)
 
 
-@router.post("/reviewer/review", response_model=ReviewResult)
+@agent_router.post("/reviewer/review", response_model=ReviewResult)
 async def review_evidence(
     payload: ReviewerRequest,
     reviewer: Annotated[EvidenceReviewer, Depends(_get_reviewer)],
@@ -100,7 +108,7 @@ async def review_evidence(
     return await reviewer.review(payload)
 
 
-@router.post("/report/generate", response_model=ReportArtifact)
+@agent_router.post("/report/generate", response_model=ReportArtifact)
 async def generate_report(
     payload: ReportRequest,
     report_agent: Annotated[ReportGenerationAgent, Depends(_get_report_agent)],
@@ -108,7 +116,7 @@ async def generate_report(
     return await report_agent.generate(payload)
 
 
-@router.post("/researcher/research", response_model=ResearchResult)
+@agent_router.post("/researcher/research", response_model=ResearchResult)
 async def conduct_research(
     payload: ResearchRequest,
     researcher: Annotated[ResearchAgent, Depends(_get_research_agent)],
@@ -141,8 +149,11 @@ async def start_run(
     idempotency_key: IdempotencyKey,
     principal: Annotated[Principal, Depends(_get_principal)],
     service: Annotated[RunControlService, Depends(_get_run_control)],
+    dispatcher: Annotated[JobDispatcher, Depends(_get_job_dispatcher)],
 ) -> ResearchRun:
-    return await service.start_run(principal, run_id, idempotency_key=idempotency_key)
+    run = await service.start_run(principal, run_id, idempotency_key=idempotency_key)
+    await dispatcher.dispatch(make_phase_job(run, JobPhase.CLARIFY))
+    return run
 
 
 @router.post("/runs/{run_id}/clarifications", response_model=ResearchRun)
@@ -152,14 +163,19 @@ async def update_clarification(
     idempotency_key: IdempotencyKey,
     principal: Annotated[Principal, Depends(_get_principal)],
     service: Annotated[RunControlService, Depends(_get_run_control)],
+    dispatcher: Annotated[JobDispatcher, Depends(_get_job_dispatcher)],
 ) -> ResearchRun:
-    return await service.record_clarification(
+    run = await service.record_clarification(
         principal,
         run_id,
         payload.brief,
         scope_ready=payload.scope_ready,
         idempotency_key=idempotency_key,
     )
+    await dispatcher.dispatch(
+        make_phase_job(run, JobPhase.PLAN if run.state.value == "PLANNING" else JobPhase.CLARIFY)
+    )
+    return run
 
 
 @router.put("/runs/{run_id}/plan", response_model=ResearchRun)
@@ -180,8 +196,11 @@ async def approve_run_plan(
     idempotency_key: IdempotencyKey,
     principal: Annotated[Principal, Depends(_get_principal)],
     service: Annotated[RunControlService, Depends(_get_run_control)],
+    dispatcher: Annotated[JobDispatcher, Depends(_get_job_dispatcher)],
 ) -> ResearchRun:
-    return await service.approve_plan(principal, run_id, payload, idempotency_key=idempotency_key)
+    run = await service.approve_plan(principal, run_id, payload, idempotency_key=idempotency_key)
+    await dispatcher.dispatch(make_phase_job(run, JobPhase.RESEARCH))
+    return run
 
 
 @router.post("/runs/{run_id}/cancel", response_model=ResearchRun)

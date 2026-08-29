@@ -4,6 +4,7 @@ import json
 import re
 from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 
+from deep_research.agents.cancellation import CancellationCheck, check_cancellation
 from deep_research.contracts.evidence import (
     BudgetUsage,
     EvidenceClaim,
@@ -76,12 +77,25 @@ class ResearchAgent:
         self._gateway = gateway
         self._adapter = adapter
 
-    async def research(self, request: ResearchRequest) -> ResearchResult:
-        execution_plan, planning_calls = await self._plan_operations(request)
-        materials, tool_limitations, search_count = await self._execute_plan(
-            execution_plan, request
+    async def research(
+        self,
+        request: ResearchRequest,
+        *,
+        cancellation_check: CancellationCheck | None = None,
+    ) -> ResearchResult:
+        await check_cancellation(cancellation_check)
+        execution_plan, planning_calls = await self._plan_operations(
+            request, cancellation_check=cancellation_check
         )
-        synthesis, synthesis_calls = await self._synthesize(request, materials)
+        await check_cancellation(cancellation_check)
+        materials, tool_limitations, search_count = await self._execute_plan(
+            execution_plan, request, cancellation_check=cancellation_check
+        )
+        await check_cancellation(cancellation_check)
+        synthesis, synthesis_calls = await self._synthesize(
+            request, materials, cancellation_check=cancellation_check
+        )
+        await check_cancellation(cancellation_check)
         evidence = self._finalize_evidence(synthesis, materials)
         unique_sources = len(evidence.sources)
         usage = request.budget_usage
@@ -94,9 +108,7 @@ class ResearchAgent:
             output_tokens=usage.output_tokens,
             estimated_cost_usd=usage.estimated_cost_usd,
         )
-        limitations = list(
-            dict.fromkeys([*tool_limitations, *synthesis.limitations])
-        )[:50]
+        limitations = list(dict.fromkeys([*tool_limitations, *synthesis.limitations]))[:50]
         if not materials:
             limitations = [
                 *limitations,
@@ -111,11 +123,15 @@ class ResearchAgent:
         )
 
     async def _plan_operations(
-        self, request: ResearchRequest
+        self,
+        request: ResearchRequest,
+        *,
+        cancellation_check: CancellationCheck | None = None,
     ) -> tuple[ResearchExecutionPlan, int]:
         prompt = self._planning_prompt(request)
         last_error: ValueError | None = None
         for repair_attempt in range(2):
+            await check_cancellation(cancellation_check)
             if last_error is not None:
                 prompt = (
                     f"{prompt}\nThe prior operation plan failed deterministic validation: "
@@ -127,6 +143,7 @@ class ResearchAgent:
                 output_type=ResearchExecutionPlan,
                 system_prompt=PLAN_SYSTEM_PROMPT,
             )
+            await check_cancellation(cancellation_check)
             try:
                 self._validate_execution_plan(result, request)
                 return result, repair_attempt + 1
@@ -141,9 +158,7 @@ class ResearchAgent:
         execution_plan: ResearchExecutionPlan, request: ResearchRequest
     ) -> None:
         task = request.task
-        operation_count = len(execution_plan.web_searches) + len(
-            execution_plan.upload_searches
-        )
+        operation_count = len(execution_plan.web_searches) + len(execution_plan.upload_searches)
         run_remaining = max(
             0, request.plan.budget.max_search_queries - request.budget_usage.searches
         )
@@ -177,20 +192,24 @@ class ResearchAgent:
         self,
         execution_plan: ResearchExecutionPlan,
         request: ResearchRequest,
+        *,
+        cancellation_check: CancellationCheck | None = None,
     ) -> tuple[list[CapturedMaterial], list[str], int]:
         limitations: list[str] = []
-        search_count = len(execution_plan.web_searches) + len(
-            execution_plan.upload_searches
-        )
+        search_count = len(execution_plan.web_searches) + len(execution_plan.upload_searches)
         web_batches = await asyncio.gather(
             *(
-                self._safe_web_search(operation, request.task.tool_timeout_seconds)
+                self._safe_web_search(
+                    operation, request.task.tool_timeout_seconds, cancellation_check
+                )
                 for operation in execution_plan.web_searches
             )
         )
         upload_batches = await asyncio.gather(
             *(
-                self._safe_upload_search(operation, request.task.tool_timeout_seconds)
+                self._safe_upload_search(
+                    operation, request.task.tool_timeout_seconds, cancellation_check
+                )
                 for operation in execution_plan.upload_searches
             )
         )
@@ -218,8 +237,7 @@ class ResearchAgent:
             request.task.max_sources,
             max(
                 0,
-                request.plan.budget.max_accepted_sources
-                - request.budget_usage.fetched_sources,
+                request.plan.budget.max_accepted_sources - request.budget_usage.fetched_sources,
             ),
         )
         fetch_results = await asyncio.gather(
@@ -227,6 +245,7 @@ class ResearchAgent:
                 self._safe_fetch(
                     FetchPageRequest(url=candidate.url),
                     request.task.tool_timeout_seconds,
+                    cancellation_check,
                 )
                 for candidate in unique_candidates[:source_remaining]
             )
@@ -273,44 +292,64 @@ class ResearchAgent:
         return materials, limitations, search_count
 
     async def _safe_web_search(
-        self, operation: WebSearchOperation, timeout_seconds: float
+        self,
+        operation: WebSearchOperation,
+        timeout_seconds: float,
+        cancellation_check: CancellationCheck | None = None,
     ) -> tuple[list[WebSearchResult], str | None]:
+        await check_cancellation(cancellation_check)
         try:
             results = await asyncio.wait_for(
                 self._adapter.search_web(operation), timeout=timeout_seconds
             )
-            return results[: operation.max_results], None
         except Exception as exc:
             return [], f"Web search failed: {type(exc).__name__}."
+        await check_cancellation(cancellation_check)
+        return results[: operation.max_results], None
 
     async def _safe_upload_search(
-        self, operation: UploadSearchOperation, timeout_seconds: float
+        self,
+        operation: UploadSearchOperation,
+        timeout_seconds: float,
+        cancellation_check: CancellationCheck | None = None,
     ) -> tuple[list[UploadChunk], str | None]:
+        await check_cancellation(cancellation_check)
         try:
             results = await asyncio.wait_for(
                 self._adapter.search_uploads(operation), timeout=timeout_seconds
             )
-            return results[: operation.max_chunks], None
         except Exception as exc:
             return [], f"Upload search failed: {type(exc).__name__}."
+        await check_cancellation(cancellation_check)
+        return results[: operation.max_chunks], None
 
     async def _safe_fetch(
-        self, request: FetchPageRequest, timeout_seconds: float
+        self,
+        request: FetchPageRequest,
+        timeout_seconds: float,
+        cancellation_check: CancellationCheck | None = None,
     ) -> tuple[FetchedPage | None, str | None]:
+        await check_cancellation(cancellation_check)
         try:
             page = await asyncio.wait_for(
                 self._adapter.fetch_page(request), timeout=timeout_seconds
             )
-            return page, None
         except Exception as exc:
             return None, f"Page fetch failed: {type(exc).__name__}."
+        await check_cancellation(cancellation_check)
+        return page, None
 
     async def _synthesize(
-        self, request: ResearchRequest, materials: list[CapturedMaterial]
+        self,
+        request: ResearchRequest,
+        materials: list[CapturedMaterial],
+        *,
+        cancellation_check: CancellationCheck | None = None,
     ) -> tuple[ResearchSynthesisDraft, int]:
         prompt = self._synthesis_prompt(request, materials)
         last_error: ValueError | None = None
         for repair_attempt in range(2):
+            await check_cancellation(cancellation_check)
             if last_error is not None:
                 prompt = (
                     f"{prompt}\nThe prior synthesis failed deterministic validation: "
@@ -322,6 +361,7 @@ class ResearchAgent:
                 output_type=ResearchSynthesisDraft,
                 system_prompt=SYNTHESIS_SYSTEM_PROMPT,
             )
+            await check_cancellation(cancellation_check)
             try:
                 self._validate_synthesis(result, request, materials)
                 return result, repair_attempt + 1
@@ -370,9 +410,7 @@ class ResearchAgent:
             for selection in claim.evidence:
                 material = material_by_id.get(selection.material_id)
                 if material is None:
-                    raise ValueError(
-                        f"claim references unknown material {selection.material_id!r}"
-                    )
+                    raise ValueError(f"claim references unknown material {selection.material_id!r}")
                 if selection.location != material.location:
                     raise ValueError("evidence selection must preserve the captured location")
                 if _normalize_whitespace(selection.excerpt) not in _normalize_whitespace(
@@ -415,9 +453,7 @@ class ResearchAgent:
             for selection in draft_claim.evidence:
                 material = material_by_id[selection.material_id]
                 source_id = _stable_id("S", material.source_key)
-                evidence_id = _stable_id(
-                    "E", source_id, selection.location, selection.excerpt
-                )
+                evidence_id = _stable_id("E", source_id, selection.location, selection.excerpt)
                 excerpt = EvidenceExcerpt(
                     evidence_id=evidence_id,
                     source_id=source_id,
@@ -500,9 +536,7 @@ class ResearchAgent:
         )
 
     @staticmethod
-    def _synthesis_prompt(
-        request: ResearchRequest, materials: list[CapturedMaterial]
-    ) -> str:
+    def _synthesis_prompt(request: ResearchRequest, materials: list[CapturedMaterial]) -> str:
         payload = {
             "task": request.task.model_dump(mode="json"),
             "repair_task": request.repair_task.model_dump(mode="json")
@@ -524,8 +558,7 @@ def canonicalize_url(url: str) -> str:
     filtered_query = [
         (name, value)
         for name, value in parse_qsl(parsed.query, keep_blank_values=True)
-        if name.casefold() not in _TRACKING_PARAMETERS
-        and not name.casefold().startswith("utm_")
+        if name.casefold() not in _TRACKING_PARAMETERS and not name.casefold().startswith("utm_")
     ]
     path = parsed.path or "/"
     return urlunsplit(
@@ -561,9 +594,7 @@ def merge_research_results(results: list[ResearchResult]) -> EvidencePackage:
         for item in result.evidence.sources:
             existing = sources.get(item.source_id)
             if existing is not None and existing != item:
-                raise ValueError(
-                    f"conflicting source ID {item.source_id!r} across workstreams"
-                )
+                raise ValueError(f"conflicting source ID {item.source_id!r} across workstreams")
             sources[item.source_id] = item
         for item in result.evidence.excerpts:
             existing = excerpts.get(item.evidence_id)
@@ -582,9 +613,7 @@ def merge_research_results(results: list[ResearchResult]) -> EvidencePackage:
                 or existing.section_ids != item.section_ids
                 or existing.normalized_claim != item.normalized_claim
             ):
-                raise ValueError(
-                    f"conflicting claim ID {item.claim_id!r} across workstreams"
-                )
+                raise ValueError(f"conflicting claim ID {item.claim_id!r} across workstreams")
             strength_rank = {
                 SupportStrength.WEAK: 1,
                 SupportStrength.MODERATE: 2,

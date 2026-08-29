@@ -42,8 +42,8 @@ class ResearchTask(BaseModel):
     section_ids: list[Identifier] = Field(min_length=1, max_length=20)
     candidate_queries: list[QueryText] = Field(default_factory=list, max_length=50)
     permitted_tools: set[ResearchTool] = Field(min_length=1)
-    max_queries: int = Field(gt=0)
-    max_sources: int = Field(gt=0)
+    max_queries: int = Field(ge=0)
+    max_sources: int = Field(ge=0)
     max_material_chars: int = Field(default=200_000, ge=10_000, le=1_000_000)
     tool_timeout_seconds: float = Field(default=30, gt=0, le=120)
     attempt: int = Field(default=1, ge=1, le=3)
@@ -83,8 +83,12 @@ class ResearchTask(BaseModel):
         tools = {ResearchTool.SEARCH_WEB, ResearchTool.FETCH_PAGE}
         if workstream.uses_uploads:
             tools.add(ResearchTool.SEARCH_UPLOADS)
-        query_limit = max_queries or max(1, len(workstream.candidate_queries))
-        source_limit = max_sources or plan.budget.max_accepted_sources
+        query_limit = (
+            len(workstream.candidate_queries) if max_queries is None else max_queries
+        )
+        source_limit = (
+            plan.budget.max_accepted_sources if max_sources is None else max_sources
+        )
         if query_limit > plan.budget.max_search_queries:
             raise ValueError("task query ceiling exceeds the approved run ceiling")
         if source_limit > plan.budget.max_accepted_sources:

@@ -2,6 +2,7 @@ import json
 
 from pydantic import ValidationError
 
+from deep_research.agents.cancellation import CancellationCheck, check_cancellation
 from deep_research.contracts.planning import (
     BudgetLimits,
     PlannerRequest,
@@ -34,12 +35,18 @@ class PlanningAgent:
     def __init__(self, gateway: StructuredModelGateway) -> None:
         self._gateway = gateway
 
-    async def create_plan(self, request: PlannerRequest) -> ResearchPlan:
+    async def create_plan(
+        self,
+        request: PlannerRequest,
+        *,
+        cancellation_check: CancellationCheck | None = None,
+    ) -> ResearchPlan:
         budget = BudgetLimits.for_preset(request.depth)
         prompt = self._build_prompt(request, budget)
         last_error: ValueError | None = None
 
         for repair_attempt in range(2):
+            await check_cancellation(cancellation_check)
             if last_error is not None:
                 prompt = (
                     f"{prompt}\nThe prior draft failed deterministic validation: "
@@ -51,6 +58,7 @@ class PlanningAgent:
                 output_type=ResearchPlanDraft,
                 system_prompt=SYSTEM_PROMPT,
             )
+            await check_cancellation(cancellation_check)
             try:
                 self._validate_limits(draft, request, budget)
                 version = 1 if request.previous_plan is None else request.previous_plan.version + 1

@@ -2,6 +2,7 @@ import hashlib
 import json
 import re
 
+from deep_research.agents.cancellation import CancellationCheck, check_cancellation
 from deep_research.contracts.evidence import ReviewState, SourceRecord, SourceType
 from deep_research.contracts.reporting import (
     MermaidDiagram,
@@ -48,7 +49,12 @@ class ReportGenerationAgent:
     def __init__(self, gateway: StructuredModelGateway) -> None:
         self._gateway = gateway
 
-    async def generate(self, request: ReportRequest) -> ReportArtifact:
+    async def generate(
+        self,
+        request: ReportRequest,
+        *,
+        cancellation_check: CancellationCheck | None = None,
+    ) -> ReportArtifact:
         if request.review.review_state is ReviewState.REPAIR_REQUIRED:
             raise ValueError("a report cannot be generated while evidence repair is required")
 
@@ -57,6 +63,7 @@ class ReportGenerationAgent:
         draft: ReportDraft | None = None
         diagram_results: list[MermaidValidation] = []
         for repair_attempt in range(2):
+            await check_cancellation(cancellation_check)
             if last_error is not None:
                 prompt = (
                     f"{prompt}\nThe prior report failed deterministic validation: {last_error}. "
@@ -68,6 +75,7 @@ class ReportGenerationAgent:
                 output_type=ReportDraft,
                 system_prompt=SYSTEM_PROMPT,
             )
+            await check_cancellation(cancellation_check)
             try:
                 self._validate_report(draft, request)
                 diagram_results = [self._validate_mermaid(item) for item in draft.diagrams]

@@ -25,6 +25,8 @@ from deep_research.contracts.evidence import (
     SupportStrength,
     UnsupportedClaim,
 )
+from deep_research.contracts.jobs import JobDelivery, JobPhase, PhaseJob
+from deep_research.contracts.orchestration import GraphCheckpoint, GraphNode
 from deep_research.contracts.planning import (
     BudgetLimits,
     DepthPreset,
@@ -103,11 +105,16 @@ __all__ = [
     "EvidencePackage",
     "EvidenceRepairTask",
     "FailureUpdate",
+    "GraphCheckpoint",
+    "GraphNode",
     "FollowUpQuestion",
     "FollowUpQuestionSet",
+    "JobDelivery",
+    "JobPhase",
     "FetchedPage",
     "FetchPageRequest",
     "PlannerRequest",
+    "PhaseJob",
     "PlanApprovalRequest",
     "Principal",
     "QuestionsRequest",
