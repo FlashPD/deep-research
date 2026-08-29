@@ -1,6 +1,6 @@
 from typing import Annotated
 
-from fastapi import APIRouter, Depends, Request
+from fastapi import APIRouter, Depends, Header, Query, Request
 
 from deep_research.agents.clarifier import ClarifierAgent
 from deep_research.agents.planner import PlanningAgent
@@ -14,8 +14,21 @@ from deep_research.contracts.planning import PlannerRequest, ResearchPlan
 from deep_research.contracts.questions import FollowUpQuestionSet, QuestionsRequest
 from deep_research.contracts.reporting import ReportArtifact, ReportRequest
 from deep_research.contracts.research import ResearchRequest, ResearchResult
+from deep_research.contracts.runs import (
+    ClarificationUpdate,
+    CreateRunRequest,
+    PlanApprovalRequest,
+    Principal,
+    ResearchRun,
+    RunEventPage,
+)
+from deep_research.services.runs import RunControlService
 
 router = APIRouter(prefix="/v1")
+IdempotencyKey = Annotated[
+    str,
+    Header(alias="Idempotency-Key", min_length=8, max_length=200),
+]
 
 
 def _get_clarifier(request: Request) -> ClarifierAgent:
@@ -40,6 +53,14 @@ def _get_report_agent(request: Request) -> ReportGenerationAgent:
 
 def _get_research_agent(request: Request) -> ResearchAgent:
     return request.app.state.researcher
+
+
+def _get_run_control(request: Request) -> RunControlService:
+    return request.app.state.run_control
+
+
+def _get_principal(request: Request) -> Principal:
+    return request.state.principal
 
 
 @router.get("/health")
@@ -93,3 +114,92 @@ async def conduct_research(
     researcher: Annotated[ResearchAgent, Depends(_get_research_agent)],
 ) -> ResearchResult:
     return await researcher.research(payload)
+
+
+@router.post("/runs", response_model=ResearchRun, status_code=201)
+async def create_run(
+    payload: CreateRunRequest,
+    idempotency_key: IdempotencyKey,
+    principal: Annotated[Principal, Depends(_get_principal)],
+    service: Annotated[RunControlService, Depends(_get_run_control)],
+) -> ResearchRun:
+    return await service.create_run(principal, payload, idempotency_key=idempotency_key)
+
+
+@router.get("/runs/{run_id}", response_model=ResearchRun)
+async def get_run(
+    run_id: str,
+    principal: Annotated[Principal, Depends(_get_principal)],
+    service: Annotated[RunControlService, Depends(_get_run_control)],
+) -> ResearchRun:
+    return await service.get_run(principal, run_id)
+
+
+@router.post("/runs/{run_id}/start", response_model=ResearchRun)
+async def start_run(
+    run_id: str,
+    idempotency_key: IdempotencyKey,
+    principal: Annotated[Principal, Depends(_get_principal)],
+    service: Annotated[RunControlService, Depends(_get_run_control)],
+) -> ResearchRun:
+    return await service.start_run(principal, run_id, idempotency_key=idempotency_key)
+
+
+@router.post("/runs/{run_id}/clarifications", response_model=ResearchRun)
+async def update_clarification(
+    run_id: str,
+    payload: ClarificationUpdate,
+    idempotency_key: IdempotencyKey,
+    principal: Annotated[Principal, Depends(_get_principal)],
+    service: Annotated[RunControlService, Depends(_get_run_control)],
+) -> ResearchRun:
+    return await service.record_clarification(
+        principal,
+        run_id,
+        payload.brief,
+        scope_ready=payload.scope_ready,
+        idempotency_key=idempotency_key,
+    )
+
+
+@router.put("/runs/{run_id}/plan", response_model=ResearchRun)
+async def save_run_plan(
+    run_id: str,
+    payload: ResearchPlan,
+    idempotency_key: IdempotencyKey,
+    principal: Annotated[Principal, Depends(_get_principal)],
+    service: Annotated[RunControlService, Depends(_get_run_control)],
+) -> ResearchRun:
+    return await service.save_plan(principal, run_id, payload, idempotency_key=idempotency_key)
+
+
+@router.post("/runs/{run_id}/plan/approve", response_model=ResearchRun)
+async def approve_run_plan(
+    run_id: str,
+    payload: PlanApprovalRequest,
+    idempotency_key: IdempotencyKey,
+    principal: Annotated[Principal, Depends(_get_principal)],
+    service: Annotated[RunControlService, Depends(_get_run_control)],
+) -> ResearchRun:
+    return await service.approve_plan(principal, run_id, payload, idempotency_key=idempotency_key)
+
+
+@router.post("/runs/{run_id}/cancel", response_model=ResearchRun)
+async def cancel_run(
+    run_id: str,
+    idempotency_key: IdempotencyKey,
+    principal: Annotated[Principal, Depends(_get_principal)],
+    service: Annotated[RunControlService, Depends(_get_run_control)],
+) -> ResearchRun:
+    return await service.cancel(principal, run_id, idempotency_key=idempotency_key)
+
+
+@router.get("/runs/{run_id}/events", response_model=RunEventPage)
+async def get_run_events(
+    run_id: str,
+    principal: Annotated[Principal, Depends(_get_principal)],
+    service: Annotated[RunControlService, Depends(_get_run_control)],
+    after: Annotated[int, Query(ge=0)] = 0,
+    limit: Annotated[int, Query(ge=1, le=100)] = 100,
+) -> RunEventPage:
+    return await service.get_events(principal, run_id, after_cursor=after, limit=limit)
