@@ -10,12 +10,15 @@ from deep_research.agents.questions import QuestionsAgent
 from deep_research.agents.report import ReportGenerationAgent
 from deep_research.agents.researcher import ResearchAgent
 from deep_research.agents.reviewer import EvidenceReviewer
-from deep_research.api.routes import router
+from deep_research.api.routes import agent_router, router
 from deep_research.auth.cognito import (
     AuthenticationError,
     RequestAuthenticator,
     build_authenticator,
 )
+from deep_research.jobs.base import JobDispatcher
+from deep_research.jobs.memory import InMemoryJobDispatcher
+from deep_research.jobs.sqs import SQSJobDispatcher
 from deep_research.models.gateway import ModelGateway, StructuredModelGateway
 from deep_research.persistence.dynamodb import DynamoDBRunRepository
 from deep_research.persistence.memory import InMemoryRunRepository
@@ -37,28 +40,35 @@ def create_app(
     research_adapter: ResearchAdapter | None = None,
     run_repository: RunRepository | None = None,
     authenticator: RequestAuthenticator | None = None,
+    job_dispatcher: JobDispatcher | None = None,
+    expose_agent_debug_routes: bool | None = None,
 ) -> FastAPI:
     @asynccontextmanager
     async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         settings = get_settings()
-        configured_gateway = gateway or ModelGateway(settings.load_models())
-        app.state.clarifier = ClarifierAgent(configured_gateway)
-        app.state.planner = PlanningAgent(configured_gateway)
-        app.state.questions = QuestionsAgent(configured_gateway)
-        app.state.reviewer = EvidenceReviewer(configured_gateway)
-        app.state.report = ReportGenerationAgent(configured_gateway)
-        app.state.researcher = ResearchAgent(
-            configured_gateway, research_adapter or UnconfiguredResearchAdapter()
-        )
+        if app.state.expose_agent_debug_routes:
+            configured_gateway = gateway or ModelGateway(settings.load_models())
+            app.state.clarifier = ClarifierAgent(configured_gateway)
+            app.state.planner = PlanningAgent(configured_gateway)
+            app.state.questions = QuestionsAgent(configured_gateway)
+            app.state.reviewer = EvidenceReviewer(configured_gateway)
+            app.state.report = ReportGenerationAgent(configured_gateway)
+            app.state.researcher = ResearchAgent(
+                configured_gateway, research_adapter or UnconfiguredResearchAdapter()
+            )
         configured_repository = run_repository or _build_run_repository(settings)
         app.state.run_control = RunControlService(
             configured_repository,
             retention_days=settings.run_retention_days,
         )
         app.state.authenticator = authenticator or build_authenticator(settings)
+        app.state.job_dispatcher = job_dispatcher or _build_job_dispatcher(settings)
         yield
 
     app = FastAPI(title="Deep Research API", version="0.1.0", lifespan=lifespan)
+    app.state.expose_agent_debug_routes = (
+        gateway is not None if expose_agent_debug_routes is None else expose_agent_debug_routes
+    )
 
     @app.middleware("http")
     async def authenticate_request(request, call_next):
@@ -90,6 +100,8 @@ def create_app(
             lambda _request, exc: JSONResponse(status_code=409, content={"detail": str(exc)}),
         )
     app.include_router(router)
+    if app.state.expose_agent_debug_routes:
+        app.include_router(agent_router)
     return app
 
 
@@ -102,6 +114,17 @@ def _build_run_repository(settings) -> RunRepository:
         settings.dynamodb_runs_table
     )
     return DynamoDBRunRepository(table)
+
+
+def _build_job_dispatcher(settings) -> JobDispatcher:
+    if not settings.sqs_jobs_queue_url:
+        return InMemoryJobDispatcher()
+    import boto3
+
+    return SQSJobDispatcher(
+        boto3.client("sqs", region_name=settings.aws_region),
+        settings.sqs_jobs_queue_url,
+    )
 
 
 app = create_app()

@@ -17,6 +17,14 @@ def test_review_and_report_routes_are_exposed() -> None:
     assert "/v1/runs/{run_id}/events" in paths
 
 
+def test_production_api_schema_excludes_long_running_agent_execution() -> None:
+    paths = create_app().openapi()["paths"]
+
+    assert "/v1/researcher/research" not in paths
+    assert "/v1/reviewer/review" not in paths
+    assert "/v1/runs/{run_id}/start" in paths
+
+
 def test_run_api_creates_reads_starts_and_replays_events() -> None:
     app = create_app(
         FakeGateway(),

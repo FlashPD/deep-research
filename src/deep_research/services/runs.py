@@ -7,6 +7,7 @@ from typing import Any
 
 from deep_research.contracts.clarification import ResearchBrief
 from deep_research.contracts.evidence import BudgetUsage
+from deep_research.contracts.orchestration import GraphCheckpoint, GraphNode
 from deep_research.contracts.planning import ResearchPlan
 from deep_research.contracts.runs import (
     CreateRunRequest,
@@ -128,6 +129,9 @@ class RunControlService:
         *,
         scope_ready: bool,
         idempotency_key: str,
+        checkpoint: GraphCheckpoint | None = None,
+        budget_usage: BudgetUsage | None = None,
+        expected_revision: int | None = None,
     ) -> ResearchRun:
         payload = {
             "run_id": run_id,
@@ -138,15 +142,25 @@ class RunControlService:
         if replay := await self._replay(principal, idempotency_key, fingerprint):
             return replay
         current = await self._repository.get(principal, run_id)
+        if expected_revision is not None and current.revision != expected_revision:
+            raise ConcurrencyConflictError("run revision changed while clarifier was executing")
         if current.state is not RunState.CLARIFYING:
             raise InvalidRunTransitionError("clarification is only valid while CLARIFYING")
         target = RunState.PLANNING if scope_ready else RunState.CLARIFYING
+        if budget_usage is not None:
+            _validate_monotonic_budget(current.budget_usage, budget_usage)
+        if checkpoint is not None:
+            checkpoint = checkpoint.model_copy(update={"checkpointed_at": self._now()})
         updated, event = self._mutation(
             current,
             state=target,
             event_type="clarification.completed" if scope_ready else "clarification.requested",
             event_payload={"state": target.value, "scope_ready": scope_ready},
-            extra={"brief": brief},
+            extra={
+                "brief": brief,
+                **({"graph_checkpoint": checkpoint} if checkpoint is not None else {}),
+                **({"budget_usage": budget_usage} if budget_usage is not None else {}),
+            },
         )
         return await self._commit(principal, current, updated, event, idempotency_key, fingerprint)
 
@@ -157,6 +171,9 @@ class RunControlService:
         plan: ResearchPlan,
         *,
         idempotency_key: str,
+        checkpoint: GraphCheckpoint | None = None,
+        budget_usage: BudgetUsage | None = None,
+        expected_revision: int | None = None,
     ) -> ResearchRun:
         fingerprint = _fingerprint(
             "save_plan", {"run_id": run_id, "plan": plan.model_dump(mode="json")}
@@ -164,6 +181,8 @@ class RunControlService:
         if replay := await self._replay(principal, idempotency_key, fingerprint):
             return replay
         current = await self._repository.get(principal, run_id)
+        if expected_revision is not None and current.revision != expected_revision:
+            raise ConcurrencyConflictError("run revision changed while planner was executing")
         if current.state not in {RunState.PLANNING, RunState.AWAITING_PLAN_APPROVAL}:
             raise InvalidRunTransitionError("a plan cannot be saved in the current state")
         if current.brief is None or plan.brief != current.brief:
@@ -171,6 +190,21 @@ class RunControlService:
         expected_version = 1 if current.plan is None else current.plan.version + 1
         if plan.version != expected_version:
             raise RunCommandConflictError(f"next plan version must be {expected_version}")
+        if budget_usage is not None:
+            _validate_monotonic_budget(current.budget_usage, budget_usage)
+        checkpoint = (checkpoint or current.graph_checkpoint).model_copy(
+            update={
+                "plan_version": plan.version,
+                "plan_hash": plan.content_hash,
+                "research_results": {},
+                "evidence": None,
+                "review": None,
+                "repair_round": 0,
+                "report": None,
+                "questions": None,
+                "checkpointed_at": self._now(),
+            }
+        )
         updated, event = self._mutation(
             current,
             state=RunState.AWAITING_PLAN_APPROVAL,
@@ -184,6 +218,8 @@ class RunControlService:
                 "plan": plan,
                 "approved_plan_version": None,
                 "approved_plan_hash": None,
+                "graph_checkpoint": checkpoint,
+                **({"budget_usage": budget_usage} if budget_usage is not None else {}),
             },
         )
         return await self._commit(principal, current, updated, event, idempotency_key, fingerprint)
@@ -210,6 +246,17 @@ class RunControlService:
             or approval.content_hash != current.plan.content_hash
         ):
             raise StalePlanApprovalError("plan version or content hash is stale")
+        completed_nodes = list(current.graph_checkpoint.completed_nodes)
+        if GraphNode.PLAN_APPROVAL not in completed_nodes:
+            completed_nodes.append(GraphNode.PLAN_APPROVAL)
+        checkpoint = current.graph_checkpoint.model_copy(
+            update={
+                "completed_nodes": completed_nodes,
+                "plan_version": current.plan.version,
+                "plan_hash": current.plan.content_hash,
+                "checkpointed_at": self._now(),
+            }
+        )
         updated, event = self._mutation(
             current,
             state=RunState.RESEARCHING,
@@ -222,6 +269,7 @@ class RunControlService:
             extra={
                 "approved_plan_version": approval.version,
                 "approved_plan_hash": approval.content_hash,
+                "graph_checkpoint": checkpoint,
             },
         )
         return await self._commit(principal, current, updated, event, idempotency_key, fingerprint)
@@ -271,6 +319,76 @@ class RunControlService:
             extra={"budget_usage": budget_usage},
         )
         return await self._commit(principal, current, updated, event, idempotency_key, fingerprint)
+
+    async def checkpoint_worker_progress(
+        self,
+        principal: Principal,
+        run_id: str,
+        checkpoint: GraphCheckpoint,
+        *,
+        expected_revision: int,
+        idempotency_key: str,
+        event_type: str,
+        event_payload: dict[str, Any],
+        target: RunState | None = None,
+        budget_usage: BudgetUsage | None = None,
+    ) -> ResearchRun:
+        """Atomically persist one worker node result through the control plane.
+
+        The explicit revision is captured before external work starts. It prevents a slow
+        worker from overwriting cancellation, approval edits, or a newer worker checkpoint.
+        """
+        _validate_safe_event_payload(event_payload)
+        fingerprint = _fingerprint(
+            "checkpoint_worker_progress",
+            {
+                "run_id": run_id,
+                "event_type": event_type,
+                "event_payload": event_payload,
+                "target": target.value if target else None,
+            },
+        )
+        if replay := await self._replay(principal, idempotency_key, fingerprint):
+            return replay
+        current = await self._repository.get(principal, run_id)
+        if current.revision != expected_revision:
+            raise ConcurrencyConflictError("run revision changed while worker node was executing")
+        next_state = target or current.state
+        if target is not None and target is not current.state:
+            _validate_transition(current.state, target)
+        if budget_usage is not None:
+            _validate_monotonic_budget(current.budget_usage, budget_usage)
+        if next_state in {
+            RunState.RESEARCHING,
+            RunState.REVIEWING,
+            RunState.GENERATING_REPORT,
+            RunState.GENERATING_QUESTIONS,
+            RunState.COMPLETED,
+        }:
+            self.assert_exact_plan_approved(current)
+        checkpoint = checkpoint.model_copy(update={"checkpointed_at": self._now()})
+        extra: dict[str, Any] = {"graph_checkpoint": checkpoint}
+        if budget_usage is not None:
+            extra["budget_usage"] = budget_usage
+        updated, event = self._mutation(
+            current,
+            state=next_state,
+            event_type=event_type,
+            event_payload=event_payload,
+            extra=extra,
+        )
+        return await self._commit(principal, current, updated, event, idempotency_key, fingerprint)
+
+    @staticmethod
+    def assert_exact_plan_approved(run: ResearchRun) -> None:
+        if (
+            run.plan is None
+            or run.approved_plan_version != run.plan.version
+            or run.approved_plan_hash != run.plan.content_hash
+        ):
+            raise StalePlanApprovalError(
+                "public-web research requires approval of the exact current plan"
+            )
 
     async def cancel(
         self, principal: Principal, run_id: str, *, idempotency_key: str
@@ -455,6 +573,27 @@ def _validate_monotonic_budget(current: BudgetUsage, updated: BudgetUsage) -> No
     for field in type(current).model_fields:
         if getattr(updated, field) < getattr(current, field):
             raise RunCommandConflictError(f"budget field {field!r} cannot decrease")
+
+
+def _validate_safe_event_payload(payload: dict[str, Any]) -> None:
+    forbidden = {"prompt", "content", "excerpt", "token", "secret", "authorization"}
+
+    def validate_keys(value: Any) -> None:
+        if isinstance(value, dict):
+            if any(str(key).casefold() in forbidden for key in value):
+                raise ValueError(
+                    "worker progress events may contain only safe display metadata"
+                )
+            for nested in value.values():
+                validate_keys(nested)
+        elif isinstance(value, list):
+            for nested in value:
+                validate_keys(nested)
+
+    validate_keys(payload)
+    encoded = json.dumps(payload, sort_keys=True, separators=(",", ":"))
+    if len(encoded.encode()) > 8_192:
+        raise ValueError("worker progress event payload exceeds 8 KiB")
 
 
 def _fingerprint(operation: str, payload: Any) -> str:

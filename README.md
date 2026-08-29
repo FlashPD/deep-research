@@ -21,9 +21,12 @@ Implemented so far:
 - an authenticated run control plane with validated lifecycle transitions, exact plan approval,
   idempotent commands, optimistic concurrency, cancellation, budgets, and replayable events;
 - tenant/owner-aware in-memory and DynamoDB repositories with 30-day TTL metadata;
+- a versioned phase-job protocol with acknowledged in-memory and SQS dispatch adapters;
+- a durable worker with optimistic, idempotent graph checkpoints, bounded parallel workstreams,
+  cooperative cancellation, monotonic usage accounting, and deterministic finalization;
 - Cognito access-token verification with cached JWKS, issuer, signature, app-client, token-use,
   expiry, identity, and scope checks;
-- FastAPI endpoints for each implemented agent, run commands, event replay, and a health check;
+- FastAPI command endpoints that persist and dispatch work, plus opt-in agent debug endpoints;
 - credential-free unit tests using fake structured model responses.
 
 ## Local setup
@@ -37,6 +40,7 @@ playwright install chromium
 cp .env.example .env
 pytest
 uvicorn deep_research.api.app:app --reload
+deep-research-worker
 ```
 
 Local setup defaults to `AUTH_MODE=development`, which injects a fixed local identity and must not
@@ -48,7 +52,23 @@ Model routes live in [`config/models.yaml`](config/models.yaml). Bedrock uses th
 credential chain. Direct Anthropic and OpenAI fallbacks become eligible only when their respective
 API-key environment variables are present.
 
-## Agent endpoints
+## Worker and dispatch
+
+Starting a run, completing clarification, and approving a plan enqueue typed phase jobs. The
+worker executes one bounded graph phase per delivery and checkpoints before the approval interrupt
+and after every completed outer node or research workstream. A replacement worker resumes from the
+canonical checkpoint; duplicate Standard-queue delivery is safe through optimistic revisions and
+node-scoped idempotency keys.
+
+Without `SQS_JOBS_QUEUE_URL`, dispatch uses an in-memory acknowledged queue. API and worker must be
+composed with the same dispatcher and repository in one process for that mode. Separate processes
+require SQS plus DynamoDB. Run a configured worker with `deep-research-worker`.
+
+The production API does not construct or expose agents. Direct agent endpoints are available only
+when `create_app` receives an explicit gateway (or `expose_agent_debug_routes=True`) for isolated
+development tests.
+
+## Agent debug endpoints
 
 ```text
 POST /v1/clarifier/evaluate
@@ -76,8 +96,8 @@ Every mutating request requires an `Idempotency-Key` header of 8–200 character
 the same command returns the original response; reusing it for different input returns `409`.
 Plan approval requires the exact current plan version and canonical SHA-256 hash. Lifecycle updates
 atomically persist the new run revision, one immutable ordered event, and the idempotency response.
-Event polling accepts a cursor so clients can reconnect without losing progress. Live SSE delivery
-and durable worker dispatch belong to the graph/worker layer that consumes this control plane.
+Event polling accepts a cursor so clients can reconnect without losing progress. Worker events
+contain only safe phase metadata, checksums, counts, and budget totals—not prompts or evidence text.
 
 Without `DYNAMODB_RUNS_TABLE`, runs use process-local memory for development and tests. When the
 table is configured, the repository uses one DynamoDB table with string partition/sort keys named

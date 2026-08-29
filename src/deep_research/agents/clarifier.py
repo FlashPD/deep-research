@@ -1,5 +1,6 @@
 import json
 
+from deep_research.agents.cancellation import CancellationCheck, check_cancellation
 from deep_research.contracts.clarification import (
     AnswerType,
     ClarificationDecision,
@@ -27,7 +28,13 @@ class ClarifierAgent:
     def __init__(self, gateway: StructuredModelGateway) -> None:
         self._gateway = gateway
 
-    async def evaluate(self, request: ClarifierRequest) -> ClarificationDecision:
+    async def evaluate(
+        self,
+        request: ClarifierRequest,
+        *,
+        cancellation_check: CancellationCheck | None = None,
+    ) -> ClarificationDecision:
+        await check_cancellation(cancellation_check)
         confirmation = next(
             (
                 answer
@@ -51,6 +58,7 @@ class ClarifierAgent:
             output_type=ClarificationDecision,
             system_prompt=SYSTEM_PROMPT,
         )
+        await check_cancellation(cancellation_check)
         if request.round_number < MAX_CLARIFICATION_ROUNDS:
             return decision
         if decision.status == "scope_ready":

@@ -6,6 +6,7 @@ from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 from deep_research.contracts.clarification import ResearchBrief
 from deep_research.contracts.evidence import BudgetUsage
+from deep_research.contracts.orchestration import GraphCheckpoint
 from deep_research.contracts.planning import DepthPreset, ResearchPlan
 
 RunId = Annotated[str, Field(pattern=r"^[a-f0-9]{32}$")]
@@ -80,6 +81,7 @@ class ResearchRun(BaseModel):
     approved_plan_version: int | None = Field(default=None, ge=1)
     approved_plan_hash: str | None = Field(default=None, pattern=r"^[a-f0-9]{64}$")
     budget_usage: BudgetUsage = Field(default_factory=BudgetUsage)
+    graph_checkpoint: GraphCheckpoint = Field(default_factory=GraphCheckpoint)
     failure_code: str | None = Field(default=None, max_length=200)
     failure_message: str | None = Field(default=None, max_length=2_000)
 

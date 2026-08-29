@@ -1,5 +1,6 @@
 import json
 
+from deep_research.agents.cancellation import CancellationCheck, check_cancellation
 from deep_research.contracts.evidence import (
     CoverageStatus,
     ReviewDraft,
@@ -33,13 +34,19 @@ class EvidenceReviewer:
     def __init__(self, gateway: StructuredModelGateway) -> None:
         self._gateway = gateway
 
-    async def review(self, request: ReviewerRequest) -> ReviewResult:
+    async def review(
+        self,
+        request: ReviewerRequest,
+        *,
+        cancellation_check: CancellationCheck | None = None,
+    ) -> ReviewResult:
         if request.repair_round > request.plan.budget.reviewer_retries:
             raise ValueError("repair_round exceeds the approved reviewer retry ceiling")
 
         prompt = self._build_prompt(request)
         last_error: ValueError | None = None
         for repair_attempt in range(2):
+            await check_cancellation(cancellation_check)
             if last_error is not None:
                 prompt = (
                     f"{prompt}\nThe prior review failed deterministic validation: {last_error}. "
@@ -51,6 +58,7 @@ class EvidenceReviewer:
                 output_type=ReviewDraft,
                 system_prompt=SYSTEM_PROMPT,
             )
+            await check_cancellation(cancellation_check)
             try:
                 return self._finalize(draft, request)
             except ValueError as exc:
