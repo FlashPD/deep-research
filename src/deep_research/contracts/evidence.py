@@ -12,6 +12,7 @@ SourceId = Annotated[str, Field(pattern=r"^S[1-9][0-9]*$")]
 EvidenceId = Annotated[str, Field(pattern=r"^E[1-9][0-9]*$")]
 ClaimId = Annotated[str, Field(pattern=r"^C[1-9][0-9]*$")]
 ShortText = Annotated[str, Field(min_length=1, max_length=4_000)]
+ReviewText = Annotated[str, Field(min_length=1, max_length=500)]
 
 
 class SourceType(StrEnum):
@@ -30,6 +31,7 @@ class ReviewState(StrEnum):
     APPROVED = "approved"
     REPAIR_REQUIRED = "repair_required"
     APPROVED_WITH_LIMITATIONS = "approved_with_limitations"
+    REJECTED = "rejected"
 
 
 class CoverageStatus(StrEnum):
@@ -148,7 +150,7 @@ class CoverageAssessment(BaseModel):
 
     item_id: Identifier
     status: CoverageStatus
-    rationale: ShortText
+    rationale: ReviewText
 
 
 class SourceQualityScore(BaseModel):
@@ -160,14 +162,14 @@ class SourceQualityScore(BaseModel):
     relevance: float = Field(ge=0, le=1)
     independence: float = Field(ge=0, le=1)
     accessibility: float = Field(ge=0, le=1)
-    rationale: ShortText
+    rationale: ReviewText
 
 
 class UnsupportedClaim(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     claim_id: ClaimId
-    rationale: ShortText
+    rationale: ReviewText
     material: bool = True
 
 
@@ -175,15 +177,15 @@ class EvidenceContradiction(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     claim_ids: list[ClaimId] = Field(min_length=1, max_length=20)
-    description: ShortText
-    resolution: str | None = Field(default=None, max_length=4_000)
+    description: ReviewText
+    resolution: str | None = Field(default=None, max_length=500)
 
 
 class EvidenceRepairTask(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     task_id: Identifier
-    objective: ShortText
+    objective: ReviewText
     research_question_ids: list[Identifier] = Field(min_length=1, max_length=20)
     section_ids: list[Identifier] = Field(min_length=1, max_length=20)
     candidate_queries: list[ShortText] = Field(default_factory=list, max_length=10)
@@ -201,7 +203,7 @@ class ReviewDraft(BaseModel):
     contradictions: list[EvidenceContradiction] = Field(default_factory=list, max_length=100)
     overconfident_claim_ids: list[ClaimId] = Field(default_factory=list, max_length=200)
     retry_tasks: list[EvidenceRepairTask] = Field(default_factory=list, max_length=20)
-    limitations: list[ShortText] = Field(default_factory=list, max_length=50)
+    limitations: list[ReviewText] = Field(default_factory=list, max_length=50)
     recommends_approval: bool
 
 

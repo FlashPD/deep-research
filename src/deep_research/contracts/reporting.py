@@ -7,6 +7,7 @@ from deep_research.contracts.evidence import (
     ClaimId,
     EvidencePackage,
     ReviewResult,
+    ReviewState,
     SourceId,
 )
 from deep_research.contracts.planning import ResearchPlan
@@ -103,4 +104,11 @@ class ReportRequest(BaseModel):
             raise ValueError("review result belongs to a different research plan")
         if self.review.evidence_checksum != self.evidence.calculate_checksum():
             raise ValueError("review result belongs to a different evidence package")
+        if self.review.review_state not in {
+            ReviewState.APPROVED,
+            ReviewState.APPROVED_WITH_LIMITATIONS,
+        }:
+            raise ValueError("report generation requires accepted research evidence")
+        if not any(claim.evidence_ids for claim in self.evidence.claims):
+            raise ValueError("report generation requires at least one evidence-backed claim")
         return self

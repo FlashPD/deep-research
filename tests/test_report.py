@@ -6,7 +6,10 @@ from pydantic import ValidationError
 from deep_research.agents.report import ReportGenerationAgent, ReportValidationError
 from deep_research.agents.reviewer import EvidenceReviewer
 from deep_research.contracts.evidence import ReviewerRequest, ReviewState
+from deep_research.contracts.planning import DepthPreset
 from deep_research.contracts.reporting import MermaidDiagram, ReportRequest
+from deep_research.models.config import ModelProvider
+from deep_research.models.gateway import ModelAttemptFailure, ModelInvocationError
 from tests.conftest import FakeGateway
 from tests.factories import (
     make_evidence_package,
@@ -36,6 +39,9 @@ async def test_report_agent_builds_canonical_cited_markdown() -> None:
     assert artifact.cited_source_ids == ["S1"]
     assert artifact.checksum == hashlib.sha256(artifact.markdown.encode()).hexdigest()
     assert gateway.calls[0]["role"] == "report"
+    assert "Compact report input" in gateway.calls[0]["prompt"]
+    assert "claims_by_section" in gateway.calls[0]["prompt"]
+    assert "question_coverage" not in gateway.calls[0]["prompt"]
 
 
 @pytest.mark.asyncio
@@ -110,10 +116,21 @@ async def test_report_generation_blocks_while_repair_is_required() -> None:
     review = await _approved_review()
     review = review.model_copy(update={"review_state": ReviewState.REPAIR_REQUIRED})
 
-    with pytest.raises(ValueError, match="repair is required"):
-        await ReportGenerationAgent(FakeGateway()).generate(
-            ReportRequest(plan=make_plan(), evidence=make_evidence_package(), review=review)
-        )
+    with pytest.raises(ValidationError, match="accepted research evidence"):
+        ReportRequest(plan=make_plan(), evidence=make_evidence_package(), review=review)
+
+
+@pytest.mark.asyncio
+async def test_report_request_rejects_empty_evidence() -> None:
+    evidence = make_evidence_package().model_copy(
+        update={"sources": [], "excerpts": [], "claims": []}
+    )
+    review = (await _approved_review()).model_copy(
+        update={"evidence_checksum": evidence.calculate_checksum()}
+    )
+
+    with pytest.raises(ValidationError, match="evidence-backed claim"):
+        ReportRequest(plan=make_plan(), evidence=evidence, review=review)
 
 
 @pytest.mark.asyncio
@@ -134,3 +151,72 @@ async def test_report_remains_blocked_after_bad_citation_repair() -> None:
 
     with pytest.raises(ReportValidationError):
         await ReportGenerationAgent(FakeGateway(bad, bad)).generate(request)
+
+
+def _output_limit_error() -> ModelInvocationError:
+    return ModelInvocationError(
+        "report",
+        [
+            ModelAttemptFailure(
+                target_name="anthropic_report",
+                provider=ModelProvider.ANTHROPIC,
+                model_id="report-model",
+                attempt=1,
+                max_attempts=2,
+                error_type="MaxTokensReachedException",
+                message="Model stopped generating due to maximum token limit.",
+            )
+        ],
+    )
+
+
+@pytest.mark.asyncio
+async def test_report_retries_once_with_compact_prompt_after_output_limit() -> None:
+    gateway = FakeGateway(_output_limit_error(), make_report_draft())
+    plan = make_plan(preset=DepthPreset.QUICK)
+    evidence = make_evidence_package()
+    review = await EvidenceReviewer(FakeGateway(make_review_draft())).review(
+        ReviewerRequest(plan=plan, evidence=evidence)
+    )
+    request = ReportRequest(
+        plan=plan,
+        evidence=evidence,
+        review=review,
+    )
+
+    artifact = await ReportGenerationAgent(gateway).generate(request)
+
+    assert len(gateway.calls) == 2
+    assert '"mode": "compact_retry"' in gateway.calls[1]["prompt"]
+    assert artifact.generation_metadata.prompt_version == "report-v2"
+
+
+@pytest.mark.asyncio
+async def test_second_output_limit_uses_deterministic_cited_report() -> None:
+    gateway = FakeGateway(_output_limit_error(), _output_limit_error())
+    request = ReportRequest(
+        plan=make_plan(), evidence=make_evidence_package(), review=await _approved_review()
+    )
+
+    artifact = await ReportGenerationAgent(gateway).generate(request)
+
+    assert len(gateway.calls) == 2
+    assert "deterministically from reviewed" in artifact.markdown
+    assert "[S1]" in artifact.markdown
+    assert artifact.generation_metadata.prompt_version.endswith("deterministic-fallback")
+
+
+@pytest.mark.asyncio
+async def test_quick_report_rejects_oversized_sections() -> None:
+    plan = make_plan(preset=DepthPreset.QUICK)
+    evidence = make_evidence_package()
+    review = await EvidenceReviewer(FakeGateway(make_review_draft())).review(
+        ReviewerRequest(plan=plan, evidence=evidence)
+    )
+    oversized = make_report_draft(
+        content=("Measured market growth remained positive. [S1]\n\n" * 50)
+    )
+    request = ReportRequest(plan=plan, evidence=evidence, review=review)
+
+    with pytest.raises(ReportValidationError, match="exceeds 1800 characters"):
+        await ReportGenerationAgent(FakeGateway(oversized, oversized)).generate(request)

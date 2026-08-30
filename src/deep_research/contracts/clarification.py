@@ -75,6 +75,7 @@ class ClarifierRequest(BaseModel):
     answers: list[ClarificationAnswer] = Field(default_factory=list, max_length=15)
     current_brief: ResearchBrief | None = None
     round_number: int = Field(default=1, ge=1, le=3)
+    depth: Literal["quick", "standard", "deep"] = "standard"
 
 
 class ClarificationDecision(BaseModel):

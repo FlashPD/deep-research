@@ -73,11 +73,16 @@ def make_plan_draft(*, uses_uploads: bool = False, query_count: int = 2) -> Rese
     )
 
 
-def make_plan(*, preset: DepthPreset = DepthPreset.STANDARD, uses_uploads: bool = False):
+def make_plan(
+    *,
+    preset: DepthPreset = DepthPreset.STANDARD,
+    uses_uploads: bool = False,
+    query_count: int = 2,
+):
     from deep_research.contracts.planning import ResearchPlan
 
     return ResearchPlan.finalize(
-        draft=make_plan_draft(uses_uploads=uses_uploads),
+        draft=make_plan_draft(uses_uploads=uses_uploads, query_count=query_count),
         brief=ResearchBrief(topic="EV market"),
         budget=BudgetLimits.for_preset(preset),
         version=1,

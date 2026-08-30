@@ -12,7 +12,11 @@ from deep_research.agents.planner import PlanningAgent
 from deep_research.agents.questions import QuestionsAgent
 from deep_research.agents.report import ReportGenerationAgent
 from deep_research.agents.researcher import ResearchAgent, merge_research_results
-from deep_research.agents.reviewer import EvidenceReviewer
+from deep_research.agents.reviewer import (
+    EvidenceReviewer,
+    EvidenceReviewValidationError,
+    compact_limitations,
+)
 from deep_research.contracts.clarification import ClarifierRequest
 from deep_research.contracts.evidence import (
     BudgetUsage,
@@ -22,7 +26,7 @@ from deep_research.contracts.evidence import (
 )
 from deep_research.contracts.jobs import JobDelivery, JobPhase, PhaseJob
 from deep_research.contracts.orchestration import GraphCheckpoint, GraphNode
-from deep_research.contracts.planning import PlannerRequest
+from deep_research.contracts.planning import DepthPreset, PlannerRequest, ResearchPlan
 from deep_research.contracts.questions import (
     QuestionsRequest,
     ReportContext,
@@ -37,6 +41,7 @@ from deep_research.contracts.research import (
 )
 from deep_research.contracts.runs import FailureUpdate, Principal, ResearchRun, RunState
 from deep_research.jobs.base import JobDispatcher
+from deep_research.models.gateway import ModelInvocationError
 from deep_research.orchestration.graph import BoundedResearchGraph
 from deep_research.persistence.runs import ConcurrencyConflictError
 from deep_research.services.runs import (
@@ -154,6 +159,7 @@ class DurableWorker:
                 answers=checkpoint.submitted_clarification_answers,
                 current_brief=checkpoint.current_proposed_brief or run.brief,
                 round_number=min(3, checkpoint.clarification_round + 1),
+                depth=run.depth.value,
             ),
             principal,
             run.run_id,
@@ -286,9 +292,8 @@ class DurableWorker:
                 if key.startswith("workstream:")
             }
             count = len(run.plan.workstreams)
-            base_sources, extra_sources = divmod(
-                run.plan.budget.max_accepted_sources, count
-            )
+            initial_source_budget = _initial_source_budget(run.plan)
+            base_sources, extra_sources = divmod(initial_source_budget, count)
             for index, item in enumerate(run.plan.workstreams):
                 if item.id in completed_workstreams:
                     continue
@@ -302,6 +307,25 @@ class DurableWorker:
                         None,
                     )
                 )
+
+        if is_repair and pending:
+            remaining_sources = max(
+                0,
+                run.plan.budget.max_accepted_sources - run.budget_usage.fetched_sources,
+            )
+            base_sources, extra_sources = divmod(remaining_sources, len(pending))
+            pending = [
+                (
+                    key,
+                    task.model_copy(
+                        update={
+                            "max_sources": base_sources + (1 if index < extra_sources else 0)
+                        }
+                    ),
+                    repair,
+                )
+                for index, (key, task, repair) in enumerate(pending)
+            ]
 
         # Dependencies are scheduled in waves; each wave is bounded by the approved concurrency.
         while pending:
@@ -385,6 +409,12 @@ class DurableWorker:
                             "workstream_id": task.workstream_id,
                             "task_id": result.task_id,
                             "repair_round": next_checkpoint.repair_round,
+                            "search_count": max(
+                                0,
+                                result.budget_usage.searches - base_usage.searches,
+                            ),
+                            "source_count": len(result.evidence.sources),
+                            "claim_count": len(result.evidence.claims),
                         },
                         budget_usage=bounded,
                     )
@@ -441,32 +471,43 @@ class DurableWorker:
             raise RuntimeError("review requires checkpointed evidence")
         await self._guard_active(principal, run.run_id)
         started = self._monotonic()
-        review = await self._invoke_with_cancellation(
-            self._agents.reviewer.review,
-            ReviewerRequest(
-                plan=run.plan,
-                evidence=run.graph_checkpoint.evidence,
-                budget_usage=run.budget_usage,
-                repair_round=run.graph_checkpoint.repair_round,
-            ),
-            principal,
-            run.run_id,
+        review_request = ReviewerRequest(
+            plan=run.plan,
+            evidence=run.graph_checkpoint.evidence,
+            budget_usage=run.budget_usage,
+            repair_round=run.graph_checkpoint.repair_round,
         )
+        fallback_used = False
+        try:
+            review = await self._invoke_with_cancellation(
+                self._agents.reviewer.review,
+                review_request,
+                principal,
+                run.run_id,
+            )
+        except (ModelInvocationError, EvidenceReviewValidationError) as exc:
+            await self._guard_active(principal, run.run_id)
+            review = EvidenceReviewer.deterministic_fallback(review_request, exc)
+            fallback_used = True
         current = await self._guard_active(principal, run.run_id)
         checkpoint = current.graph_checkpoint.model_copy(
             update={
                 "review": review,
                 "completed_nodes": _append_node(current.graph_checkpoint, GraphNode.REVIEWER),
                 "limitations": list(
-                    dict.fromkeys([*current.graph_checkpoint.limitations, *review.limitations])
+                    compact_limitations(
+                        [*review.limitations, *current.graph_checkpoint.limitations],
+                        max_items=(20 if run.plan.budget.preset is DepthPreset.QUICK else 60),
+                    )
                 ),
             }
         )
-        target = (
-            RunState.RESEARCHING
-            if review.review_state is ReviewState.REPAIR_REQUIRED
-            else RunState.GENERATING_REPORT
-        )
+        if review.review_state is ReviewState.REPAIR_REQUIRED:
+            target = RunState.RESEARCHING
+        elif review.review_state is ReviewState.REJECTED:
+            target = RunState.REVIEWING
+        else:
+            target = RunState.GENERATING_REPORT
         updated = await self._control.checkpoint_worker_progress(
             principal,
             run.run_id,
@@ -477,6 +518,7 @@ class DurableWorker:
             event_payload={
                 "node": GraphNode.REVIEWER.value,
                 "review_state": review.review_state.value,
+                "fallback_used": fallback_used,
             },
             target=target,
             budget_usage=_increment_budget(
@@ -485,6 +527,22 @@ class DurableWorker:
                 elapsed_seconds=self._monotonic() - started,
             ),
         )
+        if review.review_state is ReviewState.REJECTED:
+            await self._control.fail(
+                principal,
+                run.run_id,
+                FailureUpdate(
+                    code="insufficient_evidence",
+                    message=(
+                        "Evidence could not pass deterministic review; report generation was "
+                        "skipped. " + review.limitations[0]
+                    ),
+                ),
+                idempotency_key=job.idempotency_key(
+                    f"insufficient-evidence-{checkpoint.repair_round}"
+                ),
+            )
+            return
         await self._dispatch(
             updated,
             JobPhase.RESEARCH if target is RunState.RESEARCHING else JobPhase.REPORT,
@@ -704,16 +762,28 @@ class DurableWorker:
                     job.run_id,
                     FailureUpdate(
                         code=code,
-                        message=(
-                            str(exc)
-                            if isinstance(exc, ResearchServiceConfigurationError)
-                            else type(exc).__name__ if exc else code
-                        ),
+                        message=self._failure_message(delivery, code, exc),
                     ),
                     idempotency_key=job.idempotency_key(f"failure-{delivery.delivery_count}"),
                 )
         except Exception:
             return
+
+    def _failure_message(
+        self, delivery: JobDelivery, code: str, exc: Exception | None
+    ) -> str:
+        context = (
+            f"phase={delivery.job.phase.value}; "
+            f"delivery_attempt={delivery.delivery_count}/{self._max_delivery_attempts}"
+        )
+        if exc is None:
+            detail = code
+        else:
+            exception_detail = " ".join(str(exc).split())
+            detail = type(exc).__name__
+            if exception_detail:
+                detail = f"{detail}: {exception_detail}"
+        return f"{context}; {detail}"[:2_000]
 
 
 def make_phase_job(run: ResearchRun, phase: JobPhase, *, now: datetime | None = None) -> PhaseJob:
@@ -756,7 +826,9 @@ def _clamp_budget(usage: BudgetUsage, plan) -> BudgetUsage:
     return usage.model_copy(
         update={
             "elapsed_seconds": min(usage.elapsed_seconds, plan.budget.target_duration_seconds),
-            "searches": min(usage.searches, plan.budget.max_search_queries),
+            "searches": min(
+                usage.searches, plan.budget.absolute_search_query_ceiling
+            ),
             "fetched_sources": min(usage.fetched_sources, plan.budget.max_accepted_sources),
         }
     )
@@ -768,9 +840,19 @@ def _research_budget_exhausted(run: ResearchRun) -> bool:
     budget = run.plan.budget
     return (
         usage.elapsed_seconds >= budget.target_duration_seconds
-        or usage.searches >= budget.max_search_queries
+        or usage.searches >= budget.absolute_search_query_ceiling
         or usage.fetched_sources >= budget.max_accepted_sources
     )
+
+
+def _initial_source_budget(plan: ResearchPlan) -> int:
+    if (
+        plan.budget.preset is not DepthPreset.QUICK
+        or plan.budget.reviewer_retries == 0
+    ):
+        return plan.budget.max_accepted_sources
+    repair_reserve = min(2, plan.budget.max_accepted_sources - 1)
+    return plan.budget.max_accepted_sources - repair_reserve
 
 
 def _exhausted_result(task: ResearchTask, usage: BudgetUsage) -> ResearchResult:

@@ -4,10 +4,12 @@ from pydantic import ValidationError
 
 from deep_research.agents.researcher import (
     ResearchAgent,
+    _segment_materials,
     canonicalize_url,
     merge_research_results,
 )
-from deep_research.contracts.evidence import SupportStrength
+from deep_research.contracts.evidence import BudgetUsage, EvidenceRepairTask, SupportStrength
+from deep_research.contracts.planning import DepthPreset
 from deep_research.contracts.research import (
     DraftEvidenceSelection,
     DraftResearchClaim,
@@ -72,11 +74,34 @@ def make_execution_plan() -> ResearchExecutionPlan:
     )
 
 
+@pytest.mark.asyncio
+async def test_public_researcher_executes_approved_queries_without_model_planning() -> None:
+    page = make_page()
+    gateway = FakeGateway(make_synthesis(page))
+    adapter = FakeResearchAdapter(
+        search_results=[WebSearchResult(url="https://example.gov/ev", title="EV")],
+        page=page,
+    )
+
+    result = await ResearchAgent(gateway, adapter).research(make_request())
+
+    assert len(gateway.calls) == 1
+    assert "research-synthesis" in gateway.calls[0]["prompt"]
+    assert len(adapter.web_calls) == 1
+    assert adapter.web_calls[0].query == "market query 0"
+    assert result.evidence.sources
+
+
 def make_page() -> FetchedPage:
     return FetchedPage(
         final_url="https://example.gov/ev?utm_source=newsletter",
         title="Official EV statistics",
-        content="Official records show that EV sales increased by 20 percent in 2025.",
+        content=(
+            "Official records show that EV sales increased by 20 percent in 2025. "
+            "The published table covers registrations in every reporting region and explains "
+            "the collection methodology, revisions, exclusions, and comparison with 2024. "
+            "The agency reports the result as final rather than a preliminary estimate."
+        ),
         publisher="National Statistics Office",
         publication_date="2026-01-15",
         access_date="2026-08-27",
@@ -87,9 +112,10 @@ def make_page() -> FetchedPage:
 def make_synthesis(
     page: FetchedPage,
     *,
-    excerpt: str = "EV sales increased by 20 percent in 2025.",
+    segment_id: str | None = None,
 ) -> ResearchSynthesisDraft:
     material = ResearchAgent._material_from_page(page)
+    segment = _segment_materials([material])[0]
     return ResearchSynthesisDraft(
         claims=[
             DraftResearchClaim(
@@ -99,8 +125,7 @@ def make_synthesis(
                 evidence=[
                     DraftEvidenceSelection(
                         material_id=material.material_id,
-                        excerpt=excerpt,
-                        location=material.location,
+                        segment_id=segment_id or segment.segment_id,
                     )
                 ],
                 support_strength=SupportStrength.STRONG,
@@ -110,7 +135,7 @@ def make_synthesis(
 
 
 def make_request(*, uses_uploads: bool = False) -> ResearchRequest:
-    plan = make_plan(uses_uploads=uses_uploads)
+    plan = make_plan(uses_uploads=uses_uploads, query_count=1)
     return ResearchRequest(
         plan=plan,
         task=ResearchTask.for_workstream(plan, "market_analysis"),
@@ -120,7 +145,7 @@ def make_request(*, uses_uploads: bool = False) -> ResearchRequest:
 @pytest.mark.asyncio
 async def test_researcher_fetches_discovery_results_and_records_typed_evidence() -> None:
     page = make_page()
-    gateway = FakeGateway(make_execution_plan(), make_synthesis(page))
+    gateway = FakeGateway(make_synthesis(page))
     adapter = FakeResearchAdapter(
         search_results=[
             WebSearchResult(
@@ -139,10 +164,10 @@ async def test_researcher_fetches_discovery_results_and_records_typed_evidence()
     assert len(adapter.fetch_calls) == 1
     assert len(result.evidence.sources) == 1
     assert result.evidence.sources[0].canonical_url == "https://example.gov/ev"
-    assert result.evidence.excerpts[0].excerpt.startswith("EV sales increased")
+    assert "EV sales increased" in result.evidence.excerpts[0].excerpt
     assert "discovery snippet" not in result.model_dump_json()
     assert result.budget_usage.searches == 1
-    assert result.budget_usage.model_calls == 2
+    assert result.budget_usage.model_calls == 1
 
 
 @pytest.mark.asyncio
@@ -157,14 +182,49 @@ async def test_researcher_deduplicates_canonical_urls_before_fetching() -> None:
     )
 
     await ResearchAgent(
-        FakeGateway(make_execution_plan(), make_synthesis(page)), adapter
+        FakeGateway(make_synthesis(page)), adapter
     ).research(make_request())
 
     assert len(adapter.fetch_calls) == 1
 
 
 @pytest.mark.asyncio
-async def test_researcher_repairs_unpermitted_upload_operation() -> None:
+async def test_researcher_tries_later_candidates_when_initial_fetch_fails() -> None:
+    page = make_page()
+    plan = make_plan(query_count=1)
+    request = ResearchRequest(
+        plan=plan,
+        task=ResearchTask.for_workstream(plan, "market_analysis", max_sources=1),
+    )
+
+    class FallbackResearchAdapter(FakeResearchAdapter):
+        async def fetch_page(self, request: FetchPageRequest) -> FetchedPage:
+            self.fetch_calls.append(request)
+            if len(self.fetch_calls) == 1:
+                raise TimeoutError("first candidate timed out")
+            return page
+
+    adapter = FallbackResearchAdapter(
+        search_results=[
+            WebSearchResult(url="https://unavailable.example/ev", title="Unavailable"),
+            WebSearchResult(url="https://example.gov/ev", title="Official EV statistics"),
+        ],
+    )
+
+    result = await ResearchAgent(
+        FakeGateway(make_synthesis(page)), adapter
+    ).research(request)
+
+    assert len(adapter.fetch_calls) == 2
+    assert result.evidence.sources
+    assert any(
+        "Page fetch failed for unavailable.example: TimeoutError: first candidate timed out"
+        in item
+        for item in result.limitations
+    )
+
+
+def test_researcher_rejects_unpermitted_upload_operation() -> None:
     invalid = ResearchExecutionPlan(
         upload_searches=[
             UploadSearchOperation(
@@ -174,24 +234,15 @@ async def test_researcher_repairs_unpermitted_upload_operation() -> None:
         ],
         rationale="Search uploads.",
     )
-    gateway = FakeGateway(invalid, make_execution_plan(), make_synthesis(make_page()))
-    adapter = FakeResearchAdapter(
-        search_results=[WebSearchResult(url="https://example.gov/ev", title="EV")],
-        page=make_page(),
-    )
-
-    await ResearchAgent(gateway, adapter).research(make_request())
-
-    assert len(gateway.calls) == 3
-    assert "unpermitted upload" in gateway.calls[1]["prompt"]
-    assert adapter.upload_calls == []
+    with pytest.raises(ValueError, match="unpermitted upload"):
+        ResearchAgent._validate_execution_plan(invalid, make_request())
 
 
 @pytest.mark.asyncio
 async def test_researcher_repairs_excerpt_not_found_in_captured_material() -> None:
     page = make_page()
-    invalid = make_synthesis(page, excerpt="This invented quotation is not in the fetched page.")
-    gateway = FakeGateway(make_execution_plan(), invalid, make_synthesis(page))
+    invalid = make_synthesis(page, segment_id="G999")
+    gateway = FakeGateway(invalid, make_synthesis(page))
     adapter = FakeResearchAdapter(
         search_results=[WebSearchResult(url="https://example.gov/ev", title="EV")],
         page=page,
@@ -199,8 +250,8 @@ async def test_researcher_repairs_excerpt_not_found_in_captured_material() -> No
 
     result = await ResearchAgent(gateway, adapter).research(make_request())
 
-    assert len(gateway.calls) == 3
-    assert "not present in captured material" in gateway.calls[2]["prompt"]
+    assert len(gateway.calls) == 2
+    assert "unknown evidence segment" in gateway.calls[1]["prompt"]
     assert result.evidence.claims[0].evidence_ids
 
 
@@ -216,16 +267,139 @@ async def test_search_result_is_not_evidence_when_fetch_fails() -> None:
         ],
         page=TimeoutError("fetch failed"),
     )
-    gateway = FakeGateway(
-        make_execution_plan(),
-        ResearchSynthesisDraft(claims=[], limitations=["The candidate page was unavailable."]),
-    )
+    gateway = FakeGateway()
 
     result = await ResearchAgent(gateway, adapter).research(make_request())
 
     assert result.evidence.sources == []
     assert result.evidence.claims == []
-    assert any("Page fetch failed" in item for item in result.limitations)
+    assert len(gateway.calls) == 0
+    assert result.budget_usage.model_calls == 0
+    assert any(
+        "Page fetch failed for example.gov: TimeoutError: fetch failed" in item
+        for item in result.limitations
+    )
+
+
+@pytest.mark.asyncio
+async def test_shell_page_is_rejected_and_does_not_consume_source_budget() -> None:
+    page = FetchedPage(
+        final_url="https://www.youtube.com/watch?v=empty",
+        title="TV comparison video",
+        content="0:00 / 8:47",
+        publisher="YouTube",
+        access_date="2026-08-29",
+    )
+    adapter = FakeResearchAdapter(
+        search_results=[WebSearchResult(url=page.final_url, title=page.title)],
+        page=page,
+    )
+
+    result = await ResearchAgent(FakeGateway(), adapter).research(make_request())
+
+    assert result.evidence.sources == []
+    assert result.budget_usage.fetched_sources == 0
+    assert any("Rejected unusable page" in item for item in result.limitations)
+
+
+@pytest.mark.asyncio
+async def test_repair_can_use_adaptive_sixth_quick_search() -> None:
+    plan = make_plan(preset=DepthPreset.QUICK, query_count=1)
+    page = make_page()
+    adapter = FakeResearchAdapter(
+        search_results=[WebSearchResult(url=page.final_url, title=page.title)],
+        page=page,
+    )
+    request = ResearchRequest(
+        plan=plan,
+        task=ResearchTask.for_workstream(plan, "market_analysis"),
+        repair_task=EvidenceRepairTask(
+            task_id="repair_measured_review",
+            objective="Capture an independent measured review.",
+            research_question_ids=["market_size"],
+            section_ids=["market_findings"],
+            candidate_queries=["independent measured EV market review"],
+        ),
+        budget_usage=BudgetUsage(searches=5),
+    )
+
+    result = await ResearchAgent(FakeGateway(make_synthesis(page)), adapter).research(request)
+
+    assert result.budget_usage.searches == 6
+    assert adapter.web_calls[0].query == "independent measured EV market review"
+
+
+def test_unreferenced_material_is_not_an_accepted_source() -> None:
+    used_page = make_page()
+    unused_page = used_page.model_copy(
+        update={
+            "final_url": "https://example.com/unused",
+            "title": "Unused commentary",
+            "content": used_page.content.replace("20 percent", "18 percent"),
+        }
+    )
+    materials = [
+        ResearchAgent._material_from_page(used_page),
+        ResearchAgent._material_from_page(unused_page),
+    ]
+    segments = _segment_materials(materials)
+
+    evidence = ResearchAgent._finalize_evidence(
+        make_synthesis(used_page), materials, segments
+    )
+
+    assert len(evidence.sources) == 1
+    assert evidence.sources[0].canonical_url == "https://example.gov/ev"
+
+
+def test_quick_claim_limits_bound_initial_and_repair_synthesis() -> None:
+    plan = make_plan(preset=DepthPreset.QUICK, query_count=1)
+    page = make_page()
+    material = ResearchAgent._material_from_page(page)
+    segments = _segment_materials([material])
+    base_claim = make_synthesis(page).claims[0]
+    initial_request = ResearchRequest(
+        plan=plan,
+        task=ResearchTask.for_workstream(plan, "market_analysis"),
+    )
+    eight_claims = ResearchSynthesisDraft(
+        claims=[
+            base_claim.model_copy(
+                update={"normalized_claim": f"Initial finding number {index}."}
+            )
+            for index in range(8)
+        ]
+    )
+
+    with pytest.raises(ValueError, match="7-claim ceiling"):
+        ResearchAgent._validate_synthesis(
+            eight_claims, initial_request, [material], segments
+        )
+
+    repair_request = initial_request.model_copy(
+        update={
+            "repair_task": EvidenceRepairTask(
+                task_id="repair_measurement",
+                objective="Confirm a missing measurement.",
+                research_question_ids=["market_size"],
+                section_ids=["market_findings"],
+                candidate_queries=["measured EV market result"],
+            )
+        }
+    )
+    four_claims = ResearchSynthesisDraft(
+        claims=[
+            base_claim.model_copy(
+                update={"normalized_claim": f"Repair finding number {index}."}
+            )
+            for index in range(4)
+        ]
+    )
+
+    with pytest.raises(ValueError, match="3-claim ceiling"):
+        ResearchAgent._validate_synthesis(
+            four_claims, repair_request, [material], segments
+        )
 
 
 @pytest.mark.asyncio
@@ -250,6 +424,7 @@ async def test_upload_search_uses_run_bound_adapter_and_preserves_location() -> 
         access_date="2026-08-27",
     )
     material = ResearchAgent._material_from_upload(chunk)
+    segment = _segment_materials([material])[0]
     synthesis = ResearchSynthesisDraft(
         claims=[
             DraftResearchClaim(
@@ -259,8 +434,7 @@ async def test_upload_search_uses_run_bound_adapter_and_preserves_location() -> 
                 evidence=[
                     DraftEvidenceSelection(
                         material_id=material.material_id,
-                        excerpt="forecast estimates 2 million EV sales in 2027",
-                        location=chunk.location,
+                        segment_id=segment.segment_id,
                     )
                 ],
                 support_strength=SupportStrength.MODERATE,
@@ -276,7 +450,7 @@ async def test_upload_search_uses_run_bound_adapter_and_preserves_location() -> 
     assert adapter.web_calls == []
     assert len(adapter.upload_calls) == 1
     assert result.evidence.sources[0].upload_name == "forecast.pdf"
-    assert result.evidence.excerpts[0].location == "Page 4, paragraph 3"
+    assert result.evidence.excerpts[0].location.startswith("Page 4, paragraph 3")
 
 
 def test_canonicalize_url_removes_tracking_but_preserves_content_query() -> None:
@@ -301,7 +475,7 @@ async def test_parallel_workstream_results_merge_by_stable_evidence_ids() -> Non
         page=page,
     )
     result = await ResearchAgent(
-        FakeGateway(make_execution_plan(), make_synthesis(page)), adapter
+        FakeGateway(make_synthesis(page)), adapter
     ).research(make_request())
 
     merged = merge_research_results([result, result])

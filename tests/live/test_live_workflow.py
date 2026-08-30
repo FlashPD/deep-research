@@ -98,7 +98,7 @@ async def test_tavily_discovery_then_playwright_fetch() -> None:
     page = await fetcher.fetch_page(FetchPageRequest(url=results[0].url))
 
     assert page.content
-    assert page.canonical_url.startswith("https://")
+    assert page.final_url.startswith("https://")
 
 
 @pytest.mark.asyncio

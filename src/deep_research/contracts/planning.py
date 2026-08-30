@@ -26,15 +26,20 @@ class BudgetLimits(BaseModel):
     max_accepted_sources: int = Field(gt=0)
     research_concurrency: int = Field(gt=0)
     reviewer_retries: int = Field(ge=0)
+    adaptive_search_queries: int = Field(default=0, ge=0, le=2)
+
+    @property
+    def absolute_search_query_ceiling(self) -> int:
+        return self.max_search_queries + self.adaptive_search_queries
 
     @classmethod
     def for_preset(cls, preset: DepthPreset) -> Self:
         values = {
-            DepthPreset.QUICK: (300, 8, 10, 3, 1),
-            DepthPreset.STANDARD: (900, 20, 30, 6, 2),
-            DepthPreset.DEEP: (2_700, 50, 75, 10, 2),
+            DepthPreset.QUICK: (300, 5, 10, 3, 1, 1),
+            DepthPreset.STANDARD: (900, 20, 30, 6, 2, 0),
+            DepthPreset.DEEP: (2_700, 50, 75, 10, 2, 0),
         }
-        duration, searches, sources, concurrency, retries = values[preset]
+        duration, searches, sources, concurrency, retries, adaptive_searches = values[preset]
         return cls(
             preset=preset,
             target_duration_seconds=duration,
@@ -42,6 +47,7 @@ class BudgetLimits(BaseModel):
             max_accepted_sources=sources,
             research_concurrency=concurrency,
             reviewer_retries=retries,
+            adaptive_search_queries=adaptive_searches,
         )
 
 

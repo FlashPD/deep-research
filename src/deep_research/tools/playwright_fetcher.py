@@ -165,6 +165,11 @@ class PlaywrightPageFetcher:
                     location=location,
                 )
             finally:
+                # Route handlers run in background tasks. Detach them before closing the
+                # context so an in-flight continue_/abort does not race with shutdown and
+                # emit an unhandled TargetClosedError (especially when the caller cancels
+                # this fetch at its timeout).
+                await context.unroute_all(behavior="ignoreErrors")
                 await context.close()
                 await browser.close()
 

@@ -81,3 +81,16 @@ models:
 
     with pytest.raises(ValueError, match="OPENAI_API_KEY"):
         settings.validate_model_credentials()
+
+
+def test_report_targets_have_larger_output_capacity() -> None:
+    settings = ModelSettings.from_yaml(Path("config/models.yaml"))
+
+    assert settings.targets["bedrock_report"].max_tokens == 8_192
+    assert settings.targets["anthropic_report"].max_tokens == 8_192
+    assert settings.targets["openai_report"].max_tokens == 8_192
+    assert settings.roles["report"] == [
+        "bedrock_report",
+        "anthropic_report",
+        "openai_report",
+    ]

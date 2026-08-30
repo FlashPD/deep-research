@@ -10,10 +10,11 @@ from deep_research.contracts.evidence import (
     SourceType,
     SupportStrength,
 )
-from deep_research.contracts.planning import ResearchPlan
+from deep_research.contracts.planning import DepthPreset, ResearchPlan
 
 Identifier = Annotated[str, Field(pattern=r"^[a-z][a-z0-9_]{0,63}$")]
 MaterialId = Annotated[str, Field(pattern=r"^M[1-9][0-9]*$")]
+SegmentId = Annotated[str, Field(pattern=r"^G[1-9][0-9]*$")]
 ShortText = Annotated[str, Field(min_length=1, max_length=4_000)]
 QueryText = Annotated[str, Field(min_length=1, max_length=1_000)]
 
@@ -104,6 +105,11 @@ class ResearchTask(BaseModel):
             permitted_tools=tools,
             max_queries=query_limit,
             max_sources=source_limit,
+            max_material_chars={
+                DepthPreset.QUICK: 60_000,
+                DepthPreset.STANDARD: 200_000,
+                DepthPreset.DEEP: 400_000,
+            }[plan.budget.preset],
             attempt=attempt,
         )
 
@@ -209,8 +215,7 @@ class DraftEvidenceSelection(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     material_id: MaterialId
-    excerpt: Annotated[str, Field(min_length=10, max_length=4_000)]
-    location: ShortText
+    segment_id: SegmentId
 
 
 class DraftResearchClaim(BaseModel):

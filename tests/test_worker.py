@@ -6,11 +6,12 @@ from deep_research.agents.clarifier import ClarifierAgent
 from deep_research.agents.planner import PlanningAgent
 from deep_research.agents.questions import QuestionsAgent
 from deep_research.agents.report import ReportGenerationAgent
-from deep_research.agents.reviewer import EvidenceReviewer
+from deep_research.agents.reviewer import EvidenceReviewer, EvidenceReviewValidationError
 from deep_research.contracts.clarification import ClarificationDecision, ResearchBrief
 from deep_research.contracts.evidence import BudgetUsage, CoverageStatus, ReviewState
 from deep_research.contracts.jobs import JobPhase
 from deep_research.contracts.orchestration import GraphNode
+from deep_research.contracts.planning import BudgetLimits, DepthPreset, ResearchPlan
 from deep_research.contracts.research import ResearchResult, ResearchTaskStatus
 from deep_research.contracts.runs import (
     CreateRunRequest,
@@ -22,7 +23,12 @@ from deep_research.jobs.memory import InMemoryJobDispatcher
 from deep_research.persistence.memory import InMemoryRunRepository
 from deep_research.persistence.runs import ConcurrencyConflictError
 from deep_research.services.runs import RunControlService
-from deep_research.worker import DurableWorker, WorkerAgents, make_phase_job
+from deep_research.worker import (
+    DurableWorker,
+    WorkerAgents,
+    _initial_source_budget,
+    make_phase_job,
+)
 from tests.conftest import FakeGateway
 from tests.factories import (
     make_evidence_package,
@@ -67,9 +73,40 @@ class FakeResearcher:
         )
 
 
+def test_quick_initial_research_reserves_two_source_slots_for_repair() -> None:
+    quick_plan = ResearchPlan.finalize(
+        draft=make_plan_draft(),
+        brief=ResearchBrief(topic="EV market"),
+        budget=BudgetLimits.for_preset(DepthPreset.QUICK),
+        version=1,
+    )
+
+    assert _initial_source_budget(quick_plan) == 8
+
+
 class RaisingClarifier:
     async def evaluate(self, request):
         raise RuntimeError("provider unavailable")
+
+
+class EmptyResearcher:
+    async def research(self, request, *, cancellation_check=None):
+        if cancellation_check is not None:
+            await cancellation_check()
+        return ResearchResult(
+            task_id=request.task.task_id,
+            status=ResearchTaskStatus.COMPLETED,
+            evidence=make_evidence_package().model_copy(
+                update={"sources": [], "excerpts": [], "claims": []}
+            ),
+            budget_usage=request.budget_usage.model_copy(
+                update={
+                    "searches": request.plan.budget.max_search_queries,
+                    "model_calls": request.budget_usage.model_calls + 1,
+                }
+            ),
+            limitations=["No source material was captured within the approved task bounds."],
+        )
 
 
 def _agents(
@@ -145,6 +182,184 @@ async def test_complete_mocked_workflow_is_checkpointed_and_finalized() -> None:
     assert completed.budget_usage.searches == 1
     assert completed.budget_usage.model_calls == 7
     assert research_calls == ["market_analysis"]
+
+
+@pytest.mark.asyncio
+async def test_empty_research_fails_without_dispatching_report() -> None:
+    principal = Principal(subject="empty-user", tenant_id="empty-tenant")
+    control = RunControlService(InMemoryRunRepository())
+    dispatcher = InMemoryJobDispatcher()
+    decision = ClarificationDecision(
+        status="scope_ready",
+        brief=ResearchBrief(topic="EV market", objective="Measure the market"),
+        interpretation_summary="The objective and scope are sufficiently precise.",
+    )
+    review_draft = make_review_draft(
+        coverage=CoverageStatus.MISSING,
+        recommends_approval=False,
+    ).model_copy(update={"source_scores": []})
+    report_gateway = FakeGateway(make_report_draft())
+    agents = WorkerAgents(
+        clarifier=ClarifierAgent(FakeGateway(decision)),
+        planner=PlanningAgent(FakeGateway(make_plan_draft())),
+        researcher_factory=lambda _principal, _run_id: EmptyResearcher(),
+        reviewer=EvidenceReviewer(FakeGateway(review_draft)),
+        report=ReportGenerationAgent(report_gateway),
+        questions=QuestionsAgent(FakeGateway(make_question_set(count=7))),
+    )
+    worker = DurableWorker(control, dispatcher, agents)
+    run = await _started(control, principal)
+    await dispatcher.dispatch(make_phase_job(run, JobPhase.CLARIFY))
+    await _drain(worker, dispatcher)
+    run = await control.get_run(principal, run.run_id)
+    assert run.plan is not None
+    run = await control.approve_plan(
+        principal,
+        run.run_id,
+        PlanApprovalRequest(version=run.plan.version, content_hash=run.plan.content_hash),
+        idempotency_key="approve-empty-plan",
+    )
+    await dispatcher.dispatch(make_phase_job(run, JobPhase.RESEARCH))
+
+    await _drain(worker, dispatcher)
+
+    failed = await control.get_run(principal, run.run_id)
+    assert failed.state is RunState.FAILED
+    assert failed.failure_code == "insufficient_evidence"
+    assert failed.graph_checkpoint.report is None
+    assert report_gateway.calls == []
+
+
+@pytest.mark.asyncio
+async def test_reviewer_failure_uses_partial_report_path_for_complete_evidence() -> None:
+    principal = Principal(subject="fallback-user", tenant_id="fallback-tenant")
+    control = RunControlService(InMemoryRunRepository())
+    dispatcher = InMemoryJobDispatcher()
+    base_agents = _agents([])
+    agents = WorkerAgents(
+        clarifier=base_agents.clarifier,
+        planner=base_agents.planner,
+        researcher_factory=base_agents.researcher_factory,
+        reviewer=EvidenceReviewer(
+            FakeGateway(EvidenceReviewValidationError("invalid structured review"))
+        ),
+        report=base_agents.report,
+        questions=base_agents.questions,
+    )
+    worker = DurableWorker(control, dispatcher, agents)
+    run = await _started(control, principal)
+    await worker.handle(make_phase_job(run, JobPhase.CLARIFY))
+    planning = await dispatcher.receive(wait_seconds=1)
+    assert planning is not None
+    await worker.handle(planning.job)
+    run = await control.get_run(principal, run.run_id)
+    assert run.plan is not None
+    run = await control.approve_plan(
+        principal,
+        run.run_id,
+        PlanApprovalRequest(version=run.plan.version, content_hash=run.plan.content_hash),
+        idempotency_key="approve-fallback-plan",
+    )
+    await dispatcher.dispatch(make_phase_job(run, JobPhase.RESEARCH))
+
+    assert await worker.run_once(wait_seconds=1)
+    assert await worker.run_once(wait_seconds=1)
+
+    reviewed = await control.get_run(principal, run.run_id)
+    assert reviewed.state is RunState.GENERATING_REPORT
+    assert reviewed.graph_checkpoint.review is not None
+    assert (
+        reviewed.graph_checkpoint.review.review_state
+        is ReviewState.APPROVED_WITH_LIMITATIONS
+    )
+    assert any(
+        "Semantic evidence review was unavailable" in item
+        for item in reviewed.graph_checkpoint.review.limitations
+    )
+    events = await control.get_events(principal, run.run_id)
+    reviewer_events = [
+        event
+        for event in events.events
+        if event.payload.get("node") == GraphNode.REVIEWER.value
+        and event.event_type == "graph.node.completed"
+    ]
+    assert reviewer_events[-1].payload["fallback_used"] is True
+
+
+@pytest.mark.asyncio
+async def test_independent_workstreams_start_in_parallel() -> None:
+    principal = Principal(subject="parallel-user", tenant_id="parallel-tenant")
+    control = RunControlService(InMemoryRunRepository())
+    dispatcher = InMemoryJobDispatcher()
+    release = asyncio.Event()
+    both_started = asyncio.Event()
+    started_workstreams: list[str] = []
+
+    class ConcurrentResearcher(FakeResearcher):
+        async def research(self, request, *, cancellation_check=None):
+            started_workstreams.append(request.task.workstream_id)
+            if len(started_workstreams) == 2:
+                both_started.set()
+            await release.wait()
+            return await super().research(request, cancellation_check=cancellation_check)
+
+    draft = make_plan_draft()
+    second_question = draft.questions[0].model_copy(update={"id": "adoption_rate"})
+    second_workstream = draft.workstreams[0].model_copy(
+        update={
+            "id": "adoption_analysis",
+            "research_question_ids": ["adoption_rate"],
+            "dependencies": [],
+            "candidate_queries": ["official EV adoption statistics"],
+        }
+    )
+    parallel_draft = draft.model_copy(
+        update={
+            "questions": [*draft.questions, second_question],
+            "workstreams": [*draft.workstreams, second_workstream],
+            "outline": [
+                draft.outline[0].model_copy(
+                    update={
+                        "research_question_ids": ["market_size", "adoption_rate"]
+                    }
+                )
+            ],
+        }
+    )
+    decision = ClarificationDecision(
+        status="scope_ready",
+        brief=ResearchBrief(topic="EV market", objective="Measure the market"),
+        interpretation_summary="The objective and scope are sufficiently precise.",
+    )
+    agents = _agents([])
+    agents = WorkerAgents(
+        clarifier=ClarifierAgent(FakeGateway(decision)),
+        planner=PlanningAgent(FakeGateway(parallel_draft)),
+        researcher_factory=lambda _principal, _run_id: ConcurrentResearcher([]),
+        reviewer=agents.reviewer,
+        report=agents.report,
+        questions=agents.questions,
+    )
+    worker = DurableWorker(control, dispatcher, agents)
+    run = await _started(control, principal)
+    await worker.handle(make_phase_job(run, JobPhase.CLARIFY))
+    planning = await dispatcher.receive(wait_seconds=1)
+    assert planning is not None
+    await worker.handle(planning.job)
+    run = await control.get_run(principal, run.run_id)
+    assert run.plan is not None
+    run = await control.approve_plan(
+        principal,
+        run.run_id,
+        PlanApprovalRequest(version=run.plan.version, content_hash=run.plan.content_hash),
+        idempotency_key="approve-parallel-plan",
+    )
+
+    research = asyncio.create_task(worker.handle(make_phase_job(run, JobPhase.RESEARCH)))
+    await asyncio.wait_for(both_started.wait(), timeout=1)
+    assert set(started_workstreams) == {"market_analysis", "adoption_analysis"}
+    release.set()
+    await research
 
 
 @pytest.mark.asyncio
@@ -317,6 +532,9 @@ async def test_delivery_retry_ceiling_fails_the_run_deterministically() -> None:
     failed = await control.get_run(principal, run.run_id)
     assert failed.state is RunState.FAILED
     assert failed.failure_code == "worker_retry_ceiling"
+    assert failed.failure_message == (
+        "phase=clarify; delivery_attempt=2/2; RuntimeError: provider unavailable"
+    )
 
 
 @pytest.mark.asyncio

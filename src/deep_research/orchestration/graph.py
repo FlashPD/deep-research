@@ -79,4 +79,6 @@ def _repair_required(state: Any, invocation_state: dict[str, Any]) -> bool:
 
 
 def _review_accepted(state: Any, invocation_state: dict[str, Any]) -> bool:
-    return not _repair_required(state, invocation_state)
+    return not _repair_required(state, invocation_state) and not bool(
+        invocation_state.get("review_rejected")
+    )

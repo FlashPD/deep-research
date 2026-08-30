@@ -1,6 +1,7 @@
 import asyncio
 import logging
 from collections.abc import Callable
+from dataclasses import dataclass
 from typing import Any, Protocol, TypeVar
 
 from pydantic import BaseModel
@@ -9,6 +10,12 @@ from deep_research.models.config import ModelProvider, ModelSettings, ModelTarge
 
 OutputT = TypeVar("OutputT", bound=BaseModel)
 logger = logging.getLogger(__name__)
+
+_MAX_ERROR_DETAIL_CHARS = 500
+_OUTPUT_LIMIT_ERROR_TYPES = {
+    "LengthFinishReasonError",
+    "MaxTokensReachedException",
+}
 
 
 class StructuredModelGateway(Protocol):
@@ -22,12 +29,31 @@ class StructuredModelGateway(Protocol):
     ) -> OutputT: ...
 
 
+@dataclass(frozen=True)
+class ModelAttemptFailure:
+    target_name: str
+    provider: ModelProvider
+    model_id: str
+    attempt: int
+    max_attempts: int
+    error_type: str
+    message: str
+
+    def summary(self) -> str:
+        target = f"{self.target_name}[{self.provider.value}/{self.model_id}]"
+        detail = f": {self.message}" if self.message else ""
+        return (
+            f"{target} attempt {self.attempt}/{self.max_attempts}: "
+            f"{self.error_type}{detail}"
+        )
+
+
 class ModelInvocationError(RuntimeError):
-    def __init__(self, role: str, failures: list[tuple[str, BaseException]]) -> None:
-        detail = "; ".join(f"{name}: {type(error).__name__}" for name, error in failures)
+    def __init__(self, role: str, failures: list[ModelAttemptFailure]) -> None:
+        detail = "; ".join(failure.summary() for failure in failures)
         super().__init__(f"all model targets failed for role {role!r}: {detail}")
         self.role = role
-        self.failures = failures
+        self.failures = tuple(failures)
 
 
 class ModelGateway:
@@ -52,7 +78,7 @@ class ModelGateway:
         output_type: type[OutputT],
         system_prompt: str,
     ) -> OutputT:
-        failures: list[tuple[str, BaseException]] = []
+        failures: list[ModelAttemptFailure] = []
         for target_name, target in self._settings.route_for(role):
             logger.info(
                 "model route selected role=%s provider=%s model=%s",
@@ -60,7 +86,7 @@ class ModelGateway:
                 target.provider.value,
                 target.model_id,
             )
-            for _attempt in range(target.max_attempts):
+            for attempt_index in range(target.max_attempts):
                 try:
                     return await asyncio.wait_for(
                         self._invoke(target, prompt, output_type, system_prompt),
@@ -69,7 +95,31 @@ class ModelGateway:
                 except (Exception, asyncio.CancelledError) as exc:
                     if isinstance(exc, asyncio.CancelledError):
                         raise
-                    failures.append((target_name, exc))
+                    failure = ModelAttemptFailure(
+                        target_name=target_name,
+                        provider=target.provider,
+                        model_id=target.model_id,
+                        attempt=attempt_index + 1,
+                        max_attempts=target.max_attempts,
+                        error_type=type(exc).__name__,
+                        message=_safe_error_detail(exc),
+                    )
+                    failures.append(failure)
+                    logger.warning(
+                        "model invocation failed role=%s target=%s provider=%s model=%s "
+                        "attempt=%s/%s error=%s detail=%s",
+                        role,
+                        target_name,
+                        target.provider.value,
+                        target.model_id,
+                        failure.attempt,
+                        failure.max_attempts,
+                        failure.error_type,
+                        failure.message or "<no detail>",
+                    )
+                    logger.debug("model invocation traceback", exc_info=True)
+                    if is_output_limit_failure(failure):
+                        break
         raise ModelInvocationError(role, failures)
 
     async def _invoke(
@@ -142,3 +192,24 @@ class ModelGateway:
                 params={"temperature": target.temperature},
             )
         raise AssertionError(f"unsupported model provider: {target.provider}")
+
+
+def _safe_error_detail(exc: BaseException) -> str:
+    """Keep provider diagnostics readable and bounded without logging request payloads."""
+    detail = " ".join(str(exc).split())
+    if len(detail) <= _MAX_ERROR_DETAIL_CHARS:
+        return detail
+    return f"{detail[: _MAX_ERROR_DETAIL_CHARS - 3]}..."
+
+
+def is_output_limit_failure(failure: ModelAttemptFailure) -> bool:
+    detail = failure.message.casefold()
+    return failure.error_type in _OUTPUT_LIMIT_ERROR_TYPES or (
+        "maximum token" in detail or "max token" in detail
+    )
+
+
+def is_output_limit_error(error: ModelInvocationError) -> bool:
+    return bool(error.failures) and any(
+        is_output_limit_failure(failure) for failure in error.failures
+    )
