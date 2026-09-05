@@ -1,0 +1,55 @@
+[build-system]
+requires = ["hatchling>=1.27"]
+build-backend = "hatchling.build"
+
+[project]
+name = "deep-research"
+version = "0.1.0"
+description = "AWS Strands deep-research backend"
+readme = "README.md"
+requires-python = ">=3.13,<3.14"
+dependencies = [
+  "boto3>=1.40,<2",
+  "fastapi>=0.115,<1",
+  "httpx>=0.28,<1",
+  "opensearch-py>=3.0,<4",
+  "playwright>=1.55,<2",
+  "pyjwt[crypto]>=2.10,<3",
+  "pydantic>=2.10,<3",
+  "pydantic-settings>=2.7,<3",
+  "pypdf>=6.0,<7",
+  "python-docx>=1.2,<2",
+  "pyyaml>=6.0,<7",
+  "strands-agents[anthropic,openai]>=1.27,<2",
+  "uvicorn[standard]>=0.34,<1",
+]
+
+[project.optional-dependencies]
+dev = [
+  "pytest>=8.3,<10",
+  "pytest-asyncio>=0.25,<2",
+  "ruff>=0.9,<1",
+]
+
+[project.scripts]
+deep-research-dev = "deep_research.dev_app:main"
+deep-research-run = "deep_research.cli:main"
+deep-research-worker = "deep_research.worker_app:main"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/deep_research"]
+
+[tool.pytest.ini_options]
+addopts = "-q -m 'not live'"
+testpaths = ["tests"]
+asyncio_mode = "auto"
+markers = [
+  "live: opt-in tests that call configured model, Tavily, and public-web services",
+]
+
+[tool.ruff]
+target-version = "py313"
+line-length = 100
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B", "ASYNC"]
