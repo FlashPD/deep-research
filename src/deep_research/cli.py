@@ -1,6 +1,7 @@
 import argparse
 import asyncio
 import json
+import logging
 import sys
 from collections.abc import Callable, Sequence
 from contextlib import suppress
@@ -29,6 +30,16 @@ from deep_research.worker import make_phase_job
 InputFn = Callable[[str], str]
 OutputFn = Callable[[str], None]
 
+NON_INTERACTIVE_MESSAGE = (
+    "stdin is not interactive; pass --auto-approve-plan to run non-interactively "
+    "(clarification questions still require a terminal)"
+)
+INPUT_CLOSED_MESSAGE = "Interactive input was required but stdin is closed; cancelling the run."
+
+
+def _print_flushed(text: str) -> None:
+    print(text, flush=True)
+
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
@@ -40,11 +51,30 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--provider", choices=("openai", "anthropic", "bedrock"))
     parser.add_argument("--output", type=Path, default=Path("research-reports"))
     parser.add_argument("--auto-approve-plan", action="store_true")
+    parser.add_argument(
+        "--verbose",
+        action="store_true",
+        help="Log model routing, provider fallbacks, and adapter failures to stderr.",
+    )
     return parser
 
 
-def main(argv: Sequence[str] | None = None) -> None:
+def configure_logging(verbose: bool) -> None:
+    logging.basicConfig(
+        level=logging.INFO if verbose else logging.WARNING,
+        format="%(levelname)s %(name)s: %(message)s",
+        stream=sys.stderr,
+        force=True,
+    )
+
+
+def main(argv: Sequence[str] | None = None, *, stdin_is_tty: bool | None = None) -> None:
     args = build_parser().parse_args(argv)
+    configure_logging(getattr(args, "verbose", False))
+    interactive = sys.stdin.isatty() if stdin_is_tty is None else stdin_is_tty
+    if not args.auto_approve_plan and not interactive:
+        print(NON_INTERACTIVE_MESSAGE, file=sys.stderr)
+        raise SystemExit(2)
     settings = AppSettings(
         **({"model_provider": args.provider} if args.provider is not None else {})
     )
@@ -62,7 +92,7 @@ async def run_cli(
     runtime: LocalDevelopmentRuntime,
     *,
     input_fn: InputFn = input,
-    output_fn: OutputFn = print,
+    output_fn: OutputFn = _print_flushed,
 ) -> int:
     principal = await DevelopmentAuthenticator().authenticate(None)
     worker_task = asyncio.create_task(
@@ -121,11 +151,16 @@ async def _drive_run(
             and not checkpoint.submitted_clarification_answers
         ):
             output_fn(f"\nClarification round {checkpoint.clarification_round}/3")
-            answers = _collect_answers(
-                checkpoint.pending_clarification_questions,
-                input_fn=input_fn,
-                output_fn=output_fn,
-            )
+            try:
+                answers = _collect_answers(
+                    checkpoint.pending_clarification_questions,
+                    input_fn=input_fn,
+                    output_fn=output_fn,
+                )
+            except EOFError:
+                output_fn(INPUT_CLOSED_MESSAGE)
+                await _cooperative_cancel(runtime, principal, run_id, output_fn)
+                return 2
             run = await runtime.control.submit_clarification_answers(
                 principal,
                 run_id,
@@ -139,9 +174,14 @@ async def _drive_run(
         if run.state is RunState.AWAITING_PLAN_APPROVAL and run.plan is not None:
             output_fn("\nGenerated research plan:\n")
             output_fn(run.plan.model_dump_json(indent=2))
-            approved = args.auto_approve_plan or _confirm(
-                "Approve this exact plan? [y/N] ", input_fn
-            )
+            try:
+                approved = args.auto_approve_plan or _confirm(
+                    "Approve this exact plan? [y/N] ", input_fn
+                )
+            except EOFError:
+                output_fn(INPUT_CLOSED_MESSAGE)
+                await _cooperative_cancel(runtime, principal, run_id, output_fn)
+                return 2
             if not approved:
                 await _cooperative_cancel(runtime, principal, run_id, output_fn)
                 return 1

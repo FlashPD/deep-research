@@ -1,3 +1,7 @@
+# max_tokens is a ceiling, not a spend: only generated tokens are billed. Deep-depth plans,
+# syntheses, and reviews are large structured documents (up to 20 questions, 20 workstreams,
+# 75 source scores), so the ceiling must comfortably exceed 4k tokens or the gateway reports
+# MaxTokensReachedException on every attempt. Timeouts scale with the ceiling.
 models:
   targets:
     bedrock_default:
@@ -5,47 +9,47 @@ models:
       model_id: ${DEFAULT_MODEL_ID:-global.anthropic.claude-sonnet-4-6}
       region: ${AWS_REGION:-us-east-1}
       temperature: 0.2
-      max_tokens: 4096
-      timeout_seconds: 90
+      max_tokens: 16384
+      timeout_seconds: 240
       max_attempts: 2
     bedrock_report:
       provider: bedrock
       model_id: ${DEFAULT_MODEL_ID:-global.anthropic.claude-sonnet-4-6}
       region: ${AWS_REGION:-us-east-1}
       temperature: 0.2
-      max_tokens: 8192
-      timeout_seconds: 120
+      max_tokens: 16384
+      timeout_seconds: 300
       max_attempts: 2
     anthropic_direct:
       provider: anthropic
       model_id: ${ANTHROPIC_MODEL_ID:-claude-sonnet-4-6}
       temperature: 0.2
-      max_tokens: 4096
-      timeout_seconds: 90
+      max_tokens: 16384
+      timeout_seconds: 240
       max_attempts: 2
       required_env: ANTHROPIC_API_KEY
     anthropic_report:
       provider: anthropic
       model_id: ${ANTHROPIC_MODEL_ID:-claude-sonnet-4-6}
       temperature: 0.2
-      max_tokens: 8192
-      timeout_seconds: 120
+      max_tokens: 16384
+      timeout_seconds: 300
       max_attempts: 2
       required_env: ANTHROPIC_API_KEY
     openai_direct:
       provider: openai
       model_id: ${OPENAI_MODEL_ID:-gpt-5.4}
       temperature: 0.2
-      max_tokens: 4096
-      timeout_seconds: 90
+      max_tokens: 16384
+      timeout_seconds: 240
       max_attempts: 2
       required_env: OPENAI_API_KEY
     openai_report:
       provider: openai
       model_id: ${OPENAI_MODEL_ID:-gpt-5.4}
       temperature: 0.2
-      max_tokens: 8192
-      timeout_seconds: 120
+      max_tokens: 16384
+      timeout_seconds: 300
       max_attempts: 2
       required_env: OPENAI_API_KEY
   roles:

@@ -37,7 +37,7 @@ class BudgetLimits(BaseModel):
         values = {
             DepthPreset.QUICK: (300, 5, 10, 3, 1, 1),
             DepthPreset.STANDARD: (900, 20, 30, 6, 2, 0),
-            DepthPreset.DEEP: (2_700, 50, 75, 10, 2, 0),
+            DepthPreset.DEEP: (1_200, 50, 75, 10, 2, 0),
         }
         duration, searches, sources, concurrency, retries, adaptive_searches = values[preset]
         return cls(

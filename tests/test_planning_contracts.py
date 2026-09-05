@@ -13,7 +13,7 @@ def test_depth_presets_match_architecture_ceilings() -> None:
     assert quick.max_search_queries == 5
     assert quick.adaptive_search_queries == 1
     assert quick.absolute_search_query_ceiling == 6
-    assert deep.target_duration_seconds == 2_700
+    assert deep.target_duration_seconds == 1_200
     assert deep.max_search_queries == 50
     assert deep.max_accepted_sources == 75
     assert deep.research_concurrency == 10

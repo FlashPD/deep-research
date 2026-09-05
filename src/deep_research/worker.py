@@ -41,7 +41,11 @@ from deep_research.contracts.research import (
 )
 from deep_research.contracts.runs import FailureUpdate, Principal, ResearchRun, RunState
 from deep_research.jobs.base import JobDispatcher
-from deep_research.models.gateway import ModelInvocationError
+from deep_research.models.gateway import (
+    ModelInvocationError,
+    is_output_limit_error,
+    is_provider_rejection_error,
+)
 from deep_research.orchestration.graph import BoundedResearchGraph
 from deep_research.persistence.runs import ConcurrencyConflictError
 from deep_research.services.runs import (
@@ -114,6 +118,27 @@ class DurableWorker:
         except ResearchServiceConfigurationError as exc:
             await self._fail_delivery(delivery, "research_service_configuration", exc)
             await self._dispatcher.acknowledge(delivery)
+        except ValueError as exc:
+            # Validation failures (pydantic, agent *ValidationError, evidence merge conflicts,
+            # missing configuration) are deterministic: redelivery would replay the same
+            # checkpointed inputs and fail identically, so fail the run on the first attempt.
+            await self._fail_delivery(delivery, "worker_validation_error", exc)
+            await self._dispatcher.acknowledge(delivery)
+        except ModelInvocationError as exc:
+            if is_output_limit_error(exc):
+                # The same prompt will hit the same max_tokens ceiling on every redelivery.
+                await self._fail_delivery(delivery, "model_output_limit", exc)
+                await self._dispatcher.acknowledge(delivery)
+            elif is_provider_rejection_error(exc):
+                # Billing, credentials, or request shape: redelivery would only re-spend the
+                # search and fetch budget before hitting the identical rejection.
+                await self._fail_delivery(delivery, "model_provider_rejected", exc)
+                await self._dispatcher.acknowledge(delivery)
+            elif delivery.delivery_count >= self._max_delivery_attempts:
+                await self._fail_delivery(delivery, "worker_retry_ceiling", exc)
+                await self._dispatcher.acknowledge(delivery)
+            else:
+                await self._dispatcher.retry(delivery)
         except Exception as exc:
             if delivery.delivery_count >= self._max_delivery_attempts:
                 await self._fail_delivery(delivery, "worker_retry_ceiling", exc)
@@ -327,6 +352,10 @@ class DurableWorker:
                 for index, (key, task, repair) in enumerate(pending)
             ]
 
+        # One researcher (and therefore one run-bound adapter and page cache) serves every
+        # task in this phase, so parallel workstreams share a single capture per URL.
+        researcher = self._agents.researcher_factory(principal, run.run_id) if pending else None
+
         # Dependencies are scheduled in waves; each wave is bounded by the approved concurrency.
         while pending:
             current = await self._guard_active(principal, run.run_id)
@@ -355,10 +384,13 @@ class DurableWorker:
                 wave_elapsed = 0.0
             else:
                 wave_started = self._monotonic()
+                assert researcher is not None
+                # Failures are collected rather than raised so every workstream that did
+                # finish is checkpointed before the first failure is surfaced.
                 results = await asyncio.gather(
                     *(
                         self._invoke_research(
-                            self._agents.researcher_factory(principal, run.run_id),
+                            researcher,
                             ResearchRequest(
                                 plan=run.plan,
                                 task=task,
@@ -369,19 +401,24 @@ class DurableWorker:
                             run.run_id,
                         )
                         for _, task, repair in ready
-                    )
+                    ),
+                    return_exceptions=True,
                 )
                 wave_elapsed = self._monotonic() - wave_started
-            for result_index, ((key, task, _), result) in enumerate(
-                zip(ready, results, strict=True)
-            ):
+            wave_failures: list[BaseException] = []
+            elapsed_recorded = False
+            for (key, task, _), result in zip(ready, results, strict=True):
+                if isinstance(result, BaseException):
+                    wave_failures.append(result)
+                    continue
                 current = await self._guard_active(principal, run.run_id)
                 if key in current.graph_checkpoint.research_results:
                     continue
                 usage = _merge_budget_delta(current.budget_usage, base_usage, result.budget_usage)
-                if result_index == 0:
+                if not elapsed_recorded:
                     usage = _increment_budget(usage, elapsed_seconds=wave_elapsed)
-                bounded = _clamp_budget(usage, run.plan)
+                    elapsed_recorded = True
+                bounded = _clamp_budget(usage, run.plan, floor=current.budget_usage)
                 results_by_key = dict(current.graph_checkpoint.research_results)
                 results_by_key[key] = result
                 next_checkpoint = current.graph_checkpoint.model_copy(
@@ -422,6 +459,8 @@ class DurableWorker:
                     latest = await self._control.get_run(principal, run.run_id)
                     if key not in latest.graph_checkpoint.research_results:
                         raise
+            if wave_failures:
+                raise wave_failures[0]
             pending = [item for item in pending if item not in ready]
 
         current = await self._guard_active(principal, run.run_id)
@@ -822,14 +861,30 @@ def _merge_budget_delta(
     return BudgetUsage.model_validate(values)
 
 
-def _clamp_budget(usage: BudgetUsage, plan) -> BudgetUsage:
+def _clamp_budget(usage: BudgetUsage, plan, *, floor: BudgetUsage) -> BudgetUsage:
+    """Bound usage by the plan ceilings without ever going below what is already persisted.
+
+    Other phases (review, report) add elapsed time unclamped, so once a run passes its target
+    duration a naive clamp would try to write a smaller value and trip the monotonic-budget
+    check on the next research checkpoint.
+    """
+
+    def bound(value: float, ceiling: float, previous: float) -> float:
+        return max(previous, min(value, ceiling))
+
     return usage.model_copy(
         update={
-            "elapsed_seconds": min(usage.elapsed_seconds, plan.budget.target_duration_seconds),
-            "searches": min(
-                usage.searches, plan.budget.absolute_search_query_ceiling
+            "elapsed_seconds": bound(
+                usage.elapsed_seconds,
+                plan.budget.target_duration_seconds,
+                floor.elapsed_seconds,
             ),
-            "fetched_sources": min(usage.fetched_sources, plan.budget.max_accepted_sources),
+            "searches": bound(
+                usage.searches, plan.budget.absolute_search_query_ceiling, floor.searches
+            ),
+            "fetched_sources": bound(
+                usage.fetched_sources, plan.budget.max_accepted_sources, floor.fetched_sources
+            ),
         }
     )
 

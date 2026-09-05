@@ -2,6 +2,7 @@ import asyncio
 import ipaddress
 import re
 import socket
+from collections.abc import Awaitable, Callable
 from datetime import UTC, datetime
 from io import BytesIO
 from typing import Any
@@ -13,13 +14,27 @@ from deep_research.contracts.research import FetchedPage, FetchPageRequest
 _ALLOWED_PORTS = {None, 80, 443}
 _ALLOWED_SCHEMES = {"http", "https"}
 _PDF_MEDIA_TYPE = "application/pdf"
+# Sub-resources that never contribute extractable text. Aborting them before any DNS work
+# makes page loads faster and lets `networkidle` settle sooner.
+_BLOCKED_RESOURCE_TYPES = frozenset({"image", "media", "font"})
+# Default navigation + settle budget stays below the 30-second research tool timeout so the
+# fetcher's own error (not a bare cancellation) is what the research limitation records.
+_DEFAULT_NAVIGATION_TIMEOUT_MS = 20_000
+_DEFAULT_SETTLE_TIMEOUT_MS = 5_000
+
+Resolver = Callable[[str, int], Awaitable[list[ipaddress.IPv4Address | ipaddress.IPv6Address]]]
 
 
 class UnsafePublicUrlError(ValueError):
     """Raised when browser navigation could reach a non-public network target."""
 
 
-async def ensure_public_url(url: str) -> None:
+def _should_block_resource(resource_type: str) -> bool:
+    return resource_type.casefold() in _BLOCKED_RESOURCE_TYPES
+
+
+def _validate_url_shape(url: str) -> tuple[str, int]:
+    """Cheap syntactic SSRF checks; returns (hostname, port) for the network check."""
     parsed = urlsplit(url)
     if parsed.scheme.casefold() not in _ALLOWED_SCHEMES or not parsed.hostname:
         raise UnsafePublicUrlError("only absolute HTTP(S) URLs are allowed")
@@ -30,19 +45,77 @@ async def ensure_public_url(url: str) -> None:
     hostname = parsed.hostname.rstrip(".").casefold()
     if hostname == "localhost" or hostname.endswith((".localhost", ".local")):
         raise UnsafePublicUrlError("local hostnames are prohibited")
+    port = parsed.port or (443 if parsed.scheme.casefold() == "https" else 80)
+    return hostname, port
 
+
+async def _resolve_addresses(
+    hostname: str, port: int
+) -> list[ipaddress.IPv4Address | ipaddress.IPv6Address]:
     try:
-        addresses = [ipaddress.ip_address(hostname)]
+        return [ipaddress.ip_address(hostname)]
     except ValueError:
         records = await asyncio.to_thread(
-            socket.getaddrinfo,
-            hostname,
-            parsed.port or (443 if parsed.scheme.casefold() == "https" else 80),
-            type=socket.SOCK_STREAM,
+            socket.getaddrinfo, hostname, port, type=socket.SOCK_STREAM
         )
-        addresses = list({ipaddress.ip_address(record[4][0]) for record in records})
+        return list({ipaddress.ip_address(record[4][0]) for record in records})
+
+
+async def _ensure_public_addresses(
+    hostname: str, port: int, resolver: Resolver
+) -> None:
+    addresses = await resolver(hostname, port)
     if not addresses or any(not address.is_global for address in addresses):
         raise UnsafePublicUrlError("URL resolves to a non-public network address")
+
+
+async def ensure_public_url(url: str) -> None:
+    hostname, port = _validate_url_shape(url)
+    await _ensure_public_addresses(hostname, port, _resolve_addresses)
+
+
+class PublicUrlGuard:
+    """SSRF guard that resolves each host once per fetch.
+
+    A rendered page issues dozens of sub-resource requests to a handful of hosts. Without a
+    cache every request paid for a threaded DNS lookup, which was enough to push slow pages
+    past the navigation timeout.
+    """
+
+    def __init__(self, resolver: Resolver | None = None) -> None:
+        self._resolver = resolver or _resolve_addresses
+        self._verdicts: dict[tuple[str, int], UnsafePublicUrlError | None] = {}
+        self._pending: dict[tuple[str, int], asyncio.Future[None]] = {}
+
+    async def ensure(self, url: str) -> None:
+        hostname, port = _validate_url_shape(url)
+        key = (hostname, port)
+        if key in self._verdicts:
+            verdict = self._verdicts[key]
+            if verdict is not None:
+                raise verdict
+            return
+        pending = self._pending.get(key)
+        if pending is not None:
+            await asyncio.shield(pending)
+            return await self.ensure(url)
+        future = asyncio.get_running_loop().create_future()
+        self._pending[key] = future
+        try:
+            await _ensure_public_addresses(hostname, port, self._resolver)
+        except UnsafePublicUrlError as exc:
+            self._verdicts[key] = exc
+            raise
+        else:
+            self._verdicts[key] = None
+        finally:
+            self._pending.pop(key, None)
+            if not future.done():
+                future.set_result(None)
+
+    @property
+    def resolved_hosts(self) -> int:
+        return len(self._verdicts)
 
 
 class PlaywrightPageFetcher:
@@ -52,7 +125,8 @@ class PlaywrightPageFetcher:
         self,
         *,
         headless: bool = True,
-        navigation_timeout_ms: int = 30_000,
+        navigation_timeout_ms: int = _DEFAULT_NAVIGATION_TIMEOUT_MS,
+        settle_timeout_ms: int = _DEFAULT_SETTLE_TIMEOUT_MS,
         max_redirects: int = 5,
         max_response_bytes: int = 10 * 1024 * 1024,
         max_content_chars: int = 100_000,
@@ -61,6 +135,7 @@ class PlaywrightPageFetcher:
     ) -> None:
         self._headless = headless
         self._navigation_timeout_ms = navigation_timeout_ms
+        self._settle_timeout_ms = settle_timeout_ms
         self._max_redirects = max_redirects
         self._max_response_bytes = max_response_bytes
         self._max_content_chars = max_content_chars
@@ -68,8 +143,10 @@ class PlaywrightPageFetcher:
         self._browser_launch_options = browser_launch_options or {}
 
     async def fetch_page(self, request: FetchPageRequest) -> FetchedPage:
-        await ensure_public_url(request.url)
+        guard = PublicUrlGuard()
+        await guard.ensure(request.url)
         try:
+            from playwright.async_api import TimeoutError as PlaywrightTimeoutError
             from playwright.async_api import async_playwright
         except ImportError as exc:  # pragma: no cover - depends on optional browser installation
             raise RuntimeError(
@@ -89,12 +166,15 @@ class PlaywrightPageFetcher:
             )
 
             async def guard_request(route: Any) -> None:
+                if _should_block_resource(route.request.resource_type):
+                    await route.abort("blockedbyclient")
+                    return
                 target = route.request.url
                 if urlsplit(target).scheme.casefold() not in _ALLOWED_SCHEMES:
                     await route.abort("blockedbyclient")
                     return
                 try:
-                    await ensure_public_url(target)
+                    await guard.ensure(target)
                 except (UnsafePublicUrlError, OSError, ValueError):
                     await route.abort("blockedbyclient")
                     return
@@ -113,9 +193,17 @@ class PlaywrightPageFetcher:
                     raise RuntimeError("browser navigation returned no response")
                 if response.status >= 400:
                     raise RuntimeError(f"page returned HTTP {response.status}")
-                await ensure_public_url(response.url)
+                await guard.ensure(response.url)
                 if _redirect_count(response.request) > self._max_redirects:
                     raise RuntimeError("page exceeded the redirect ceiling")
+                # Let client-side rendering settle so hydrated text is captured consistently.
+                # A busy page (analytics beacons, long polling) simply proceeds after the cap.
+                try:
+                    await page.wait_for_load_state(
+                        "networkidle", timeout=self._settle_timeout_ms
+                    )
+                except PlaywrightTimeoutError:
+                    pass
 
                 content_length = await response.header_value("content-length")
                 if content_length and int(content_length) > self._max_response_bytes:

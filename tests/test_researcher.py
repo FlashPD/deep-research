@@ -339,8 +339,8 @@ def test_unreferenced_material_is_not_an_accepted_source() -> None:
         }
     )
     materials = [
-        ResearchAgent._material_from_page(used_page),
-        ResearchAgent._material_from_page(unused_page),
+        ResearchAgent._material_from_page(used_page, ordinal=1),
+        ResearchAgent._material_from_page(unused_page, ordinal=2),
     ]
     segments = _segment_materials(materials)
 
@@ -483,3 +483,164 @@ async def test_parallel_workstream_results_merge_by_stable_evidence_ids() -> Non
     assert len(merged.sources) == 1
     assert len(merged.excerpts) == 1
     assert len(merged.claims) == 1
+
+
+def _result_from_package(task_id: str, package):
+    from deep_research.contracts.evidence import BudgetUsage
+    from deep_research.contracts.research import ResearchResult, ResearchTaskStatus
+
+    return ResearchResult(
+        task_id=task_id,
+        status=ResearchTaskStatus.COMPLETED,
+        evidence=package,
+        budget_usage=BudgetUsage(),
+    )
+
+
+def _merge_two(first, second):
+    return merge_research_results(
+        [
+            _result_from_package("ws_a_attempt_1", first),
+            _result_from_package("ws_b_attempt_1", second),
+        ]
+    )
+
+
+def test_merge_tolerates_content_drift_for_the_same_public_url() -> None:
+    """Parallel workstreams fetching one dynamic page must not crash the run."""
+    from tests.factories import make_evidence_package
+
+    first = make_evidence_package()
+    drifted_source = first.sources[0].model_copy(
+        update={"content_hash": "b" * 64, "title": "Official EV statistics (refreshed)"}
+    )
+    second_excerpt = first.excerpts[0].model_copy(
+        update={"evidence_id": "E2", "excerpt": "Fleet size doubled.", "location": "Table 3"}
+    )
+    second_claim = first.claims[0].model_copy(
+        update={
+            "claim_id": "C2",
+            "normalized_claim": "Fleet size doubled.",
+            "evidence_ids": ["E2"],
+        }
+    )
+    second = first.model_copy(
+        update={
+            "sources": [drifted_source],
+            "excerpts": [second_excerpt],
+            "claims": [second_claim],
+        }
+    )
+
+    merged = _merge_two(first, second)
+
+    assert [source.source_id for source in merged.sources] == ["S1"]
+    kept = merged.sources[0]
+    assert kept.content_hash == "a" * 64, "the first capture wins"
+    assert any("differed between fetches" in flag for flag in kept.quality_flags)
+    assert {item.evidence_id for item in merged.excerpts} == {"E1", "E2"}
+    assert {item.claim_id for item in merged.claims} == {"C1", "C2"}
+
+
+@pytest.mark.asyncio
+async def test_prompt_uses_short_sequential_material_and_segment_ids() -> None:
+    page = make_page()
+    gateway = FakeGateway(make_synthesis(page))
+    adapter = FakeResearchAdapter(
+        search_results=[WebSearchResult(url="https://example.gov/ev", title="EV")],
+        page=page,
+    )
+
+    result = await ResearchAgent(gateway, adapter).research(make_request())
+
+    prompt = gateway.calls[0]["prompt"]
+    assert '"material_id": "M1"' in prompt
+    assert '"segment_id": "G1"' in prompt
+    assert result.evidence.sources[0].source_id.startswith("S")
+    assert result.evidence.excerpts[0].evidence_id.startswith("E")
+
+
+@pytest.mark.asyncio
+async def test_deep_synthesis_is_capped_by_truncation_without_a_repair_call() -> None:
+    plan = make_plan(preset=DepthPreset.DEEP, query_count=1)
+    request = ResearchRequest(plan=plan, task=ResearchTask.for_workstream(plan, "market_analysis"))
+    page = make_page()
+    base_claim = make_synthesis(page).claims[0]
+    forty_five = ResearchSynthesisDraft(
+        claims=[
+            base_claim.model_copy(update={"normalized_claim": f"Deep finding number {index}."})
+            for index in range(45)
+        ]
+    )
+    gateway = FakeGateway(forty_five)
+    adapter = FakeResearchAdapter(
+        search_results=[WebSearchResult(url="https://example.gov/ev", title="EV")],
+        page=page,
+    )
+
+    result = await ResearchAgent(gateway, adapter).research(request)
+
+    assert len(gateway.calls) == 1, "overshoot is truncated, never sent back for repair"
+    assert '"max_synthesis_claims": 40' in gateway.calls[0]["prompt"]
+    assert '"max_claim_chars": 400' in gateway.calls[0]["prompt"]
+    assert len(result.evidence.claims) == 40
+    assert result.evidence.claims[0].normalized_claim == "Deep finding number 0."
+    assert any("5 lower-priority" in item and "40-claim" in item for item in result.limitations)
+
+
+@pytest.mark.asyncio
+async def test_invalid_claims_are_dropped_after_one_repair_instead_of_failing() -> None:
+    page = make_page()
+    good = make_synthesis(page).claims[0]
+    bad = good.model_copy(
+        update={
+            "normalized_claim": "A claim citing material that was never captured.",
+            "evidence": [DraftEvidenceSelection(material_id="M13992242639790429", segment_id="G1")],
+        }
+    )
+    mixed = ResearchSynthesisDraft(claims=[good, bad])
+    gateway = FakeGateway(mixed, mixed)
+    adapter = FakeResearchAdapter(
+        search_results=[WebSearchResult(url="https://example.gov/ev", title="EV")],
+        page=page,
+    )
+
+    result = await ResearchAgent(gateway, adapter).research(make_request())
+
+    assert len(gateway.calls) == 2
+    assert "unknown material" in gateway.calls[1]["prompt"]
+    assert [claim.normalized_claim for claim in result.evidence.claims] == [
+        "EV sales increased by 20 percent in 2025."
+    ]
+    assert any("1 synthesized claim(s) were discarded" in item for item in result.limitations)
+    assert result.status is ResearchTaskStatus.COMPLETED
+
+
+@pytest.mark.asyncio
+async def test_all_claims_invalid_yields_empty_evidence_with_a_limitation() -> None:
+    page = make_page()
+    only_bad = make_synthesis(page, segment_id="G999")
+    gateway = FakeGateway(only_bad, only_bad)
+    adapter = FakeResearchAdapter(
+        search_results=[WebSearchResult(url="https://example.gov/ev", title="EV")],
+        page=page,
+    )
+
+    result = await ResearchAgent(gateway, adapter).research(make_request())
+
+    assert result.evidence.claims == []
+    assert result.evidence.sources == []
+    assert any("unknown evidence segment 'G999'" in item for item in result.limitations)
+
+
+def test_merge_still_rejects_a_source_id_bound_to_a_different_url() -> None:
+    from tests.factories import make_evidence_package
+
+    first = make_evidence_package()
+    other_url = first.sources[0].model_copy(
+        update={"canonical_url": "https://example.org/completely-different"}
+    )
+    second = first.model_copy(update={"sources": [other_url]})
+
+    with pytest.raises(ValueError, match="conflicting source ID"):
+        _merge_two(first, second)

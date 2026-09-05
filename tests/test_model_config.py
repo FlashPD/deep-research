@@ -83,12 +83,38 @@ models:
         settings.validate_model_credentials()
 
 
-def test_report_targets_have_larger_output_capacity() -> None:
+def test_model_ids_from_dotenv_reach_the_yaml_routes(monkeypatch) -> None:
+    # pydantic-settings never exports .env into os.environ, so the YAML's ${ANTHROPIC_MODEL_ID}
+    # expansion must be fed from the loaded settings, not the process environment.
+    monkeypatch.delenv("ANTHROPIC_MODEL_ID", raising=False)
+    monkeypatch.delenv("OPENAI_MODEL_ID", raising=False)
+    settings = AppSettings(
+        model_config_path=Path("config/models.yaml"),
+        model_provider="anthropic",
+        anthropic_api_key="sk-test",
+        anthropic_model_id="model-from-dotenv",
+        openai_model_id="openai-from-dotenv",
+    )
+
+    models = settings.load_models()
+
+    assert models.targets["anthropic_direct"].model_id == "model-from-dotenv"
+    assert models.targets["anthropic_report"].model_id == "model-from-dotenv"
+    assert models.targets["openai_direct"].model_id == "openai-from-dotenv"
+    assert models.targets["bedrock_default"].model_id.startswith("global.anthropic")
+
+
+def test_every_target_can_emit_deep_sized_structured_output() -> None:
     settings = ModelSettings.from_yaml(Path("config/models.yaml"))
 
-    assert settings.targets["bedrock_report"].max_tokens == 8_192
-    assert settings.targets["anthropic_report"].max_tokens == 8_192
-    assert settings.targets["openai_report"].max_tokens == 8_192
+    # A deep plan or review is far larger than 4k tokens; every target's ceiling must fit it,
+    # and the report targets get the longest timeout because they generate the most prose.
+    for name, target in settings.targets.items():
+        assert target.max_tokens >= 16_384, name
+        assert target.timeout_seconds >= 240, name
+    assert settings.targets["bedrock_report"].timeout_seconds == 300
+    assert settings.targets["anthropic_report"].timeout_seconds == 300
+    assert settings.targets["openai_report"].timeout_seconds == 300
     assert settings.roles["report"] == [
         "bedrock_report",
         "anthropic_report",

@@ -172,6 +172,78 @@ def test_reviewer_fallback_allows_only_deterministically_complete_evidence() -> 
     assert all(score.authority == 0.5 for score in result.source_scores)
 
 
+@pytest.mark.asyncio
+async def test_gap_without_retry_task_is_approved_with_limitations_not_an_error() -> None:
+    # The model judged the remaining gap unrepairable (no retry task) while retries remain.
+    draft = make_review_draft(coverage=CoverageStatus.PARTIAL, recommends_approval=False)
+    assert draft.retry_tasks == []
+    gateway = FakeGateway(draft)
+
+    result = await EvidenceReviewer(gateway).review(
+        ReviewerRequest(plan=make_plan(), evidence=make_evidence_package())
+    )
+
+    assert len(gateway.calls) == 1
+    assert result.review_state is ReviewState.APPROVED_WITH_LIMITATIONS
+    assert result.retry_tasks == []
+    assert any("proposed no repair task" in item for item in result.limitations)
+
+
+def _plan_with_narrative_section():
+    from deep_research.contracts.clarification import ResearchBrief
+    from deep_research.contracts.planning import BudgetLimits, ReportSection, ResearchPlan
+    from tests.factories import make_plan_draft
+
+    draft = make_plan_draft()
+    draft = draft.model_copy(
+        update={
+            "outline": [
+                ReportSection(
+                    id="intro", title="Introduction & Scope", purpose="Frame the report."
+                ),
+                *draft.outline,
+            ]
+        }
+    )
+    return ResearchPlan.finalize(
+        draft=draft,
+        brief=ResearchBrief(topic="EV market"),
+        budget=BudgetLimits.for_preset(DepthPreset.DEEP),
+        version=1,
+    )
+
+
+def test_fallback_treats_narrative_sections_as_limitations_not_rejection() -> None:
+    request = ReviewerRequest(plan=_plan_with_narrative_section(), evidence=make_evidence_package())
+
+    result = EvidenceReviewer.deterministic_fallback(
+        request, RuntimeError("structured review unavailable")
+    )
+
+    assert result.review_state is ReviewState.APPROVED_WITH_LIMITATIONS
+    assert not any("intro" in item for item in result.deterministic_issues)
+    assert [item.item_id for item in result.section_coverage] == ["intro", "market_findings"]
+
+
+def test_fallback_still_rejects_structurally_corrupt_evidence() -> None:
+    evidence = make_evidence_package()
+    corrupt = evidence.model_copy(
+        update={
+            "claims": [
+                evidence.claims[0].model_copy(update={"research_question_id": "not_in_plan"})
+            ]
+        }
+    )
+    request = ReviewerRequest(plan=make_plan(), evidence=corrupt)
+
+    result = EvidenceReviewer.deterministic_fallback(
+        request, RuntimeError("structured review unavailable")
+    )
+
+    assert result.review_state is ReviewState.REJECTED
+    assert any("unknown research question" in item for item in result.deterministic_issues)
+
+
 def test_reviewer_fallback_rejects_deterministically_incomplete_evidence() -> None:
     request = ReviewerRequest(
         plan=make_plan(),

@@ -1,5 +1,6 @@
 import os
 import re
+from collections.abc import Mapping
 from enum import StrEnum
 from pathlib import Path
 from typing import Any
@@ -61,9 +62,16 @@ class ModelSettings(BaseModel):
         return self
 
     @classmethod
-    def from_yaml(cls, path: str | Path) -> "ModelSettings":
+    def from_yaml(
+        cls, path: str | Path, *, overrides: Mapping[str, str] | None = None
+    ) -> "ModelSettings":
+        """Load routes, expanding ``${VAR:-default}`` from overrides first, then the environment.
+
+        Overrides let values loaded from ``.env`` by pydantic-settings reach the YAML, since
+        that loader never exports them into ``os.environ``.
+        """
         raw = Path(path).read_text(encoding="utf-8")
-        expanded = _expand_environment(raw)
+        expanded = _expand_environment(raw, overrides or {})
         document: dict[str, Any] = yaml.safe_load(expanded)
         return cls.model_validate(document["models"])
 
@@ -115,10 +123,10 @@ class ModelSettings(BaseModel):
 _ENV_PATTERN = re.compile(r"\$\{([A-Z][A-Z0-9_]*)(?::-([^}]*))?}")
 
 
-def _expand_environment(value: str) -> str:
+def _expand_environment(value: str, overrides: Mapping[str, str] | None = None) -> str:
     def replace(match: re.Match[str]) -> str:
         name, default = match.group(1), match.group(2)
-        resolved = os.getenv(name, default)
+        resolved = (overrides or {}).get(name) or os.getenv(name, default)
         if resolved is None:
             raise ValueError(f"required environment variable {name} is not set")
         return resolved

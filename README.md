@@ -29,7 +29,15 @@ Implemented so far:
 - FastAPI command endpoints that persist and dispatch work, plus opt-in agent debug endpoints;
 - a local CLI that performs clarification, approval, progress polling, cancellation, and report
   writing through the same control-plane and worker boundaries as the API;
+- a phase-scoped page cache so parallel workstreams share one capture per URL, plus tolerant
+  evidence merging when a dynamic page hashes differently between fetches;
+- fail-fast worker classification for deterministic failures (validation errors, model output
+  limits, provider billing/credential rejections) so a doomed phase is never redelivered;
+- graceful report degradation: over-length quick prose is trimmed, unsafe diagrams become prose,
+  and a still-invalid draft falls back to a deterministic, fully cited evidence-mapped report;
 - credential-free mocked tests plus explicitly selected, bounded live tests.
+
+Two completed runs are checked in as examples; see [Sample reports](#sample-reports).
 
 ## Fresh-machine local setup
 
@@ -99,7 +107,13 @@ Model routes live in [`config/models.yaml`](config/models.yaml). Set `MODEL_PROV
 normal AWS credential chain. `MODEL_FALLBACK_ORDER` optionally contains a comma-separated provider
 order. The selected provider is always first, so direct-provider development never probes Bedrock
 unless Bedrock is explicitly listed as a fallback. Keys loaded by `pydantic-settings` from `.env`
-are passed directly to the matching Strands client and are never logged.
+are passed directly to the matching Strands client and are never logged. The model-ID variables
+(`OPENAI_MODEL_ID`, `ANTHROPIC_MODEL_ID`, `DEFAULT_MODEL_ID`, `AWS_REGION`) are read from `.env`
+too and substituted into the YAML's `${VAR:-default}` placeholders.
+
+Every target allows 16k output tokens with a 4-to-5-minute timeout. Deep-depth plans, syntheses,
+and reviews are large structured documents; a smaller ceiling makes the model stop mid-output and
+the run fails with `model_output_limit`.
 
 `deep-research-dev` is the single-process development runtime. It shares one in-memory repository,
 dispatcher, control service, gateway, and durable worker with FastAPI, and stops the background
@@ -119,15 +133,60 @@ deep-research-run "Summarize current fusion milestones" --auto-approve-plan
 
 Supported options are:
 
-- `--depth quick|standard|deep`
+- `--depth quick|standard|deep` (default `standard`)
 - `--provider openai|anthropic|bedrock`, overriding `MODEL_PROVIDER` for that invocation
 - `--output PATH`, where a `.md` path is used directly and a directory receives `<run_id>.md`
+  (default directory `research-reports/`)
 - `--auto-approve-plan`, which is the only way to bypass the interactive approval prompt
+- `--verbose`, which logs model routing, provider fallbacks, and adapter failures to stderr
+
+Depth presets are fixed by the application and appear in the plan the CLI prints for approval:
+
+| Preset | Target duration | Search queries | Accepted sources | Parallel workstreams | Review repair rounds |
+|---|---|---|---|---|---|
+| `quick` | 5 min | 5 (+1 adaptive) | 10 | 3 | 1 |
+| `standard` | 15 min | 20 | 30 | 6 | 2 |
+| `deep` | 20 min | 50 | 75 | 10 | 2 |
+
+Quick runs typically finish in 6 to 9 minutes of wall time, deep runs in about 30 minutes. A
+deep run sends on the order of a million input tokens to the model provider (each workstream's
+synthesis carries up to 400k characters of fetched text), so keep credit headroom accordingly.
 
 The default flow displays typed clarification questions, submits answers for the current round,
 prints the generated plan, asks for approval of its exact version and SHA-256 hash, polls safe
 progress events, writes the completed Markdown report, and displays limitations and follow-up
 questions. Press Ctrl-C while work is running to persist a cooperative cancellation request.
+
+When stdin is not a terminal (piped input, CI, an editor task runner), the CLI refuses to start
+unless `--auto-approve-plan` is given, and cancels the run with exit code 2 if a clarification
+question still needs an answer. Parallel workstreams share one page capture per canonical URL
+for the duration of a research phase, so a page that appears in several candidate queries is
+fetched once and counted once per workstream.
+
+Reviewing the plan is worth the pause: rejecting it cancels the run, so if the planner has
+misidentified a product (for example, treating a model name as its predecessor), restart with the
+exact model numbers in the topic rather than approving and hoping the reviewer catches it.
+
+### Sample reports
+
+Two completed runs are committed under [`reports/`](reports/) as examples of the output format:
+
+- [`reports/Quick research sample report.md`](reports/Quick%20research%20sample%20report.md):
+  `--depth quick`, topic "Give me a summary of Samsung's S90D TV". About 6.5 minutes, 2
+  workstreams, 5 cited sources, one review repair round.
+- [`reports/Deep research sample report.md`](reports/Deep%20research%20sample%20report.md):
+  `--depth deep`, a three-way comparison of the Samsung S90D, LG C4, and Sony Bravia 8 with the
+  exact model numbers pinned in the topic. About 32 minutes, 6 parallel workstreams, 41 searches,
+  46 fetched sources, 225 reviewed claims, 36 cited sources.
+
+Both reports were produced by the deterministic fallback path: the model's prose draft failed a
+citation check twice (an uncited executive-summary paragraph in the quick run, multi-source
+brackets like `[S1, S2]` in the deep run, the latter now normalized before validation), so the
+report agent assembled the sections directly from reviewed, evidence-backed claims. The
+`Limitations` section of each report states this. Every `[S…]` citation resolves to an entry in
+the report's `Sources` section, and reviewer limitations, unresolved contradictions, and
+follow-up topics are preserved. New runs write to the `--output` directory; `reports/` ignores
+everything except the two samples.
 
 ## Tests
 
@@ -152,7 +211,8 @@ report citation resolution. Missing credentials cause clean skips.
 
 1. Create and start a run. The worker invokes the tool-free Clarifier.
 2. If questions are checkpointed, submit typed answers for that exact round. After three rounds,
-   proceeding requires explicit final confirmation.
+   proceeding requires explicit final confirmation. Quick depth asks at most two questions and
+   proceeds on the best available interpretation after the second round.
 3. Review the generated, versioned plan. No Tavily, Playwright, or upload operation occurs before
    its exact version and hash are approved.
 4. Poll cursor-based events while research, review, report generation, and follow-up generation run.
@@ -169,8 +229,26 @@ report citation resolution. Missing credentials cause clean skips.
 - **Chromium executable missing:** Run `playwright install chromium` inside the active virtual
   environment. On Linux, Playwright may also require its documented system dependencies.
 - **Structured-output failure:** Confirm the chosen model supports the configured Strands
-  structured-output path. Inspect the safe role/provider/model log and select another accessible
-  model ID; invalid model output receives one bounded repair attempt.
+  structured-output path. Inspect the safe role/provider/model log (`--verbose`) and select
+  another accessible model ID; invalid model output receives one bounded repair attempt, after
+  which the researcher drops the invalid claims and the report agent trims or falls back rather
+  than failing the run.
+- **Run failed with `model_output_limit`:** the model stopped at its `max_tokens` ceiling. Raise
+  `max_tokens` (and `timeout_seconds`) for that target in `config/models.yaml`; the run is not
+  retried because the same prompt would hit the same ceiling.
+- **Run failed with `model_provider_rejected`:** the provider refused the request for a reason
+  that will not change on retry, most often an exhausted credit balance or an invalid key. The
+  failure message carries the provider's text. Top up or fix the key and start a new run; nothing
+  was redelivered, so no search or fetch budget was re-spent.
+- **Run failed with `worker_validation_error`:** an agent's output or a checkpoint failed a
+  deterministic check on the first delivery. The message names the check; it is a code or prompt
+  issue, not a transient one.
+- **Run failed with `insufficient_evidence`:** no workstream produced an evidence-backed claim,
+  so there is nothing to report. Check the printed limitations for fetch failures (timeouts, 403s,
+  paywalls) and broaden the topic or fix connectivity.
+- **Report says it was "assembled deterministically":** the model's prose draft failed a hard
+  citation or outline check twice, so the report was built directly from reviewed claims. It is
+  complete and fully cited but reads as a claim list per section. See [Sample reports](#sample-reports).
 - **Tavily 401/403 or empty discovery:** Verify `TAVILY_API_KEY`, account quota, and outbound HTTPS.
   Search snippets are intentionally not accepted as evidence; Playwright must fetch a public page.
 - **Public URL rejected:** The SSRF guard rejects credentials in URLs, nonstandard ports, redirects

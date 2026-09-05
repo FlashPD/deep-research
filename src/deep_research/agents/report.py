@@ -1,5 +1,6 @@
 import hashlib
 import json
+import logging
 import re
 
 from deep_research.agents.cancellation import CancellationCheck, check_cancellation
@@ -29,6 +30,12 @@ _QUICK_CONCLUSION_CHARS = 900
 _QUICK_PARAGRAPH_CHARS = 1_200
 _CITATION = re.compile(r"\[(S[1-9][0-9]*)\]")
 _CITATION_LIKE = re.compile(r"\[(S[^\]]*)\]")
+# Models routinely cite several sources in one bracket ("[S12, S34]"); that is unambiguous, so
+# it is normalized to "[S12] [S34]" before validation instead of being rejected as malformed.
+_MULTI_CITATION = re.compile(
+    r"\[(S[1-9][0-9]*(?:\s*[,;/]?\s+S[1-9][0-9]*|\s*[,;/]\s*S[1-9][0-9]*)+)\]"
+)
+_SOURCE_ID = re.compile(r"S[1-9][0-9]*")
 _MERMAID_START = re.compile(
     r"^(?:flowchart|graph|sequenceDiagram|classDiagram|stateDiagram-v2|erDiagram|timeline|"
     r"gantt|pie|mindmap|gitGraph)\b"
@@ -37,13 +44,17 @@ _UNSAFE_MERMAID = re.compile(
     r"(?im)^\s*(?:click\b|style\b|classDef\b|linkStyle\b|%%\{|.*\b(?:href|javascript:)\b)"
 )
 _HTML_TAG = re.compile(r"</?[A-Za-z][^>]*>")
+_SENTENCE_END = re.compile(r"[.!?][\"')\]]*(?=\s)")
+_MIN_SENTENCE_CUT_RATIO = 0.4
+logger = logging.getLogger(__name__)
 
 SYSTEM_PROMPT = """You are the Report Generation Agent in a bounded deep-research workflow.
 Write a clear canonical report using only the supplied approved plan, normalized evidence, budget
 summary, and evidence-review result. You have no tools and must never invent sources or citations.
 
-Use report-local citations exactly like [S1]. Cite only source IDs connected through excerpts to a
-claim assigned to that report section. Every material factual paragraph in a findings section needs
+Use report-local citations exactly like [S1], one source ID per bracket: write [S1] [S2], never
+[S1, S2]. Cite only source IDs connected through excerpts to a claim assigned to that report
+section. Every material factual paragraph in a findings section needs
 a citation. Prefix unsupported synthesis with "Inference:" or "Analysis:". Explicitly describe
 unresolved contradictions and preserve all reviewer limitations. Produce the exact approved outline.
 Add Mermaid only when it materially clarifies the content; do not use directives, links, click
@@ -106,6 +117,7 @@ class ReportGenerationAgent:
                 continue
             await check_cancellation(cancellation_check)
             validation_attempts += 1
+            draft = _normalize_citations(draft)
             try:
                 self._validate_report(draft, request)
                 diagram_results = [self._validate_mermaid(item) for item in draft.diagrams]
@@ -116,62 +128,7 @@ class ReportGenerationAgent:
             except ValueError as exc:
                 last_error = exc
                 if validation_attempts == 2:
-                    # Diagram failures degrade to prose after exactly one repair. All other
-                    # report invariants still block generation.
-                    try:
-                        self._validate_report(draft, request)
-                    except ValueError as report_error:
-                        raise ReportValidationError(
-                            f"report remained invalid after one repair: {report_error}"
-                        ) from report_error
-                    diagram_results = [self._validate_mermaid(item) for item in draft.diagrams]
-                    if any(not item.valid for item in diagram_results):
-                        invalid_diagrams = [
-                            diagram
-                            for diagram, result in zip(
-                                draft.diagrams, diagram_results, strict=True
-                            )
-                            if not result.valid
-                        ]
-                        fallback_by_section: dict[str, list[str]] = {}
-                        for diagram in invalid_diagrams:
-                            fallback_by_section.setdefault(diagram.section_id, []).append(
-                                diagram.fallback_text
-                            )
-                        draft = draft.model_copy(
-                            update={
-                                "diagrams": [
-                                    diagram
-                                    for diagram, result in zip(
-                                        draft.diagrams, diagram_results, strict=True
-                                    )
-                                    if result.valid
-                                ],
-                                "sections": [
-                                    section.model_copy(
-                                        update={
-                                            "content": "\n\n".join(
-                                                [
-                                                    section.content,
-                                                    *(
-                                                        "Analysis: Diagram omitted under strict "
-                                                        f"validation. {fallback}"
-                                                        for fallback in fallback_by_section.get(
-                                                            section.section_id, []
-                                                        )
-                                                    ),
-                                                ]
-                                            )
-                                        }
-                                    )
-                                    for section in draft.sections
-                                ],
-                            }
-                        )
-                        break
-                    raise ReportValidationError(
-                        f"report remained invalid after one repair: {last_error}"
-                    ) from exc
+                    return self._degrade_after_repair(draft, request, exc)
 
         if draft is None:  # pragma: no cover - the model gateway either returns or raises
             raise AssertionError("report generation produced no draft")
@@ -180,6 +137,94 @@ class ReportGenerationAgent:
             request,
             diagram_results=diagram_results,
             prompt_version=REPORT_PROMPT_VERSION,
+        )
+
+    @classmethod
+    def _degrade_after_repair(
+        cls, draft: ReportDraft, request: ReportRequest, error: ValueError
+    ) -> ReportArtifact:
+        """Degrade cosmetic failures after the single repair instead of losing the report.
+
+        Invalid diagrams become prose and over-length quick-mode prose is trimmed at sentence
+        boundaries; both are recorded as limitations. Structural invariants (exact outline,
+        citation mapping, reviewer contradictions) stay hard: if the trimmed draft still fails
+        them, the deterministic evidence-mapped report is returned rather than an error.
+        """
+        limitations = list(draft.limitations)
+        diagram_results = [cls._validate_mermaid(item) for item in draft.diagrams]
+        if any(not item.valid for item in diagram_results):
+            draft = cls._replace_invalid_diagrams(draft, diagram_results)
+            diagram_results = [item for item in diagram_results if item.valid]
+        if request.plan.budget.preset is DepthPreset.QUICK:
+            draft, trimmed = _trim_quick_lengths(draft)
+            if trimmed:
+                limitations.append(
+                    "Quick-report length ceilings were enforced by trimming "
+                    f"{', '.join(trimmed)} at sentence boundaries after one repair."
+                )
+        draft = draft.model_copy(update={"limitations": list(dict.fromkeys(limitations))})
+        try:
+            cls._validate_report(draft, request)
+        except ValueError as hard_error:
+            logger.warning(
+                "report draft failed validation after one repair; using deterministic "
+                "fallback: %s",
+                hard_error,
+            )
+            detail = " ".join(str(hard_error).split())[:300]
+            return cls._deterministic_fallback(
+                request,
+                reason=(
+                    "The report model's output failed validation after one repair "
+                    f"({detail}); this concise report was assembled deterministically from "
+                    "reviewed, evidence-backed claims."
+                ),
+            )
+        logger.info("report draft accepted after degradation: %s", error)
+        return cls._artifact_from_draft(
+            draft,
+            request,
+            diagram_results=diagram_results,
+            prompt_version=REPORT_PROMPT_VERSION,
+        )
+
+    @staticmethod
+    def _replace_invalid_diagrams(
+        draft: ReportDraft, diagram_results: list[MermaidValidation]
+    ) -> ReportDraft:
+        fallback_by_section: dict[str, list[str]] = {}
+        for diagram, result in zip(draft.diagrams, diagram_results, strict=True):
+            if not result.valid:
+                fallback_by_section.setdefault(diagram.section_id, []).append(
+                    diagram.fallback_text
+                )
+        return draft.model_copy(
+            update={
+                "diagrams": [
+                    diagram
+                    for diagram, result in zip(draft.diagrams, diagram_results, strict=True)
+                    if result.valid
+                ],
+                "sections": [
+                    section.model_copy(
+                        update={
+                            "content": "\n\n".join(
+                                [
+                                    section.content,
+                                    *(
+                                        "Analysis: Diagram omitted under strict validation. "
+                                        f"{fallback}"
+                                        for fallback in fallback_by_section.get(
+                                            section.section_id, []
+                                        )
+                                    ),
+                                ]
+                            )
+                        }
+                    )
+                    for section in draft.sections
+                ],
+            }
         )
 
     @classmethod
@@ -526,7 +571,9 @@ class ReportGenerationAgent:
         )
 
     @classmethod
-    def _deterministic_fallback(cls, request: ReportRequest) -> ReportArtifact:
+    def _deterministic_fallback(
+        cls, request: ReportRequest, *, reason: str | None = None
+    ) -> ReportArtifact:
         evidence_sources = {
             item.evidence_id: item.source_id for item in request.evidence.excerpts
         }
@@ -594,7 +641,7 @@ class ReportGenerationAgent:
                 )
             )
 
-        fallback_limitation = (
+        fallback_limitation = reason or (
             "The report model exceeded its output limit; this concise report was assembled "
             "deterministically from reviewed, evidence-backed claims."
         )
@@ -621,6 +668,96 @@ class ReportGenerationAgent:
             diagram_results=[],
             prompt_version=f"{REPORT_PROMPT_VERSION}-deterministic-fallback",
         )
+
+
+def _split_multi_citations(text: str) -> str:
+    return _MULTI_CITATION.sub(
+        lambda match: " ".join(f"[{item}]" for item in _SOURCE_ID.findall(match.group(1))),
+        text,
+    )
+
+
+def _normalize_citations(draft: ReportDraft) -> ReportDraft:
+    """Rewrite "[S1, S2]" style brackets as "[S1] [S2]" in every validated text field."""
+    return draft.model_copy(
+        update={
+            "executive_summary": _split_multi_citations(draft.executive_summary),
+            "methodology": _split_multi_citations(draft.methodology),
+            "conclusion": _split_multi_citations(draft.conclusion),
+            "limitations": [_split_multi_citations(item) for item in draft.limitations],
+            "sections": [
+                section.model_copy(update={"content": _split_multi_citations(section.content)})
+                for section in draft.sections
+            ],
+            "contradictions": [
+                item.model_copy(update={"summary": _split_multi_citations(item.summary)})
+                for item in draft.contradictions
+            ],
+        }
+    )
+
+
+def _trim_quick_lengths(draft: ReportDraft) -> tuple[ReportDraft, list[str]]:
+    """Enforce quick-mode ceilings by trimming rather than rejecting; returns trimmed labels."""
+    trimmed: list[str] = []
+    updates: dict[str, object] = {}
+    for label, field, ceiling in [
+        ("the executive summary", "executive_summary", _QUICK_EXECUTIVE_SUMMARY_CHARS),
+        ("the methodology", "methodology", _QUICK_METHODOLOGY_CHARS),
+        ("the conclusion", "conclusion", _QUICK_CONCLUSION_CHARS),
+    ]:
+        value = getattr(draft, field)
+        shortened = _trim_markdown(value, ceiling)
+        if shortened != value:
+            trimmed.append(label)
+            updates[field] = shortened
+    sections = []
+    for section in draft.sections:
+        shortened = _trim_markdown(section.content, _QUICK_SECTION_CHARS)
+        if shortened != section.content:
+            trimmed.append(f"section '{section.title}'")
+            section = section.model_copy(update={"content": shortened})
+        sections.append(section)
+    if sections != list(draft.sections):
+        updates["sections"] = sections
+    if not updates:
+        return draft, []
+    return draft.model_copy(update=updates), trimmed
+
+
+def _trim_markdown(value: str, ceiling: int) -> str:
+    """Keep whole leading paragraphs (each within the paragraph ceiling) up to the field ceiling."""
+    paragraphs = [item.strip() for item in re.split(r"\n\s*\n", value.strip()) if item.strip()]
+    kept: list[str] = []
+    for paragraph in paragraphs:
+        paragraph = _trim_paragraph(paragraph, _QUICK_PARAGRAPH_CHARS)
+        candidate = "\n\n".join([*kept, paragraph])
+        if len(candidate) > ceiling:
+            if not kept:
+                kept.append(_trim_paragraph(paragraph, ceiling))
+            break
+        kept.append(paragraph)
+    return "\n\n".join(kept) or value[:ceiling].rstrip()
+
+
+def _trim_paragraph(paragraph: str, ceiling: int) -> str:
+    """Cut at the last sentence boundary; re-attach the paragraph's own citations if cut off."""
+    if len(paragraph) <= ceiling:
+        return paragraph
+    citations = list(dict.fromkeys(_CITATION.findall(paragraph)))
+    suffix = " " + " ".join(f"[{item}]" for item in citations) if citations else ""
+    budget = max(1, ceiling - len(suffix))
+    cut = paragraph[:budget]
+    boundaries = [match.end() for match in _SENTENCE_END.finditer(cut)]
+    usable = [end for end in boundaries if end >= budget * _MIN_SENTENCE_CUT_RATIO]
+    if usable:
+        body = cut[: usable[-1]].rstrip()
+    else:
+        head, _, _ = cut.rpartition(" ")
+        body = (head or cut).rstrip()
+    if suffix and not _CITATION.search(body):
+        body = f"{body}{suffix}"
+    return body
 
 
 def _material_paragraphs(markdown: str) -> list[str]:

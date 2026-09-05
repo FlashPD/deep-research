@@ -5,6 +5,11 @@ __pycache__/
 .coverage
 .env
 *.py[cod]
+# Generated run output. Only the two committed sample reports are tracked.
+research-reports/
+reports/*
+!reports/Quick research sample report.md
+!reports/Deep research sample report.md
 dist/
 build/
 *.egg-info/

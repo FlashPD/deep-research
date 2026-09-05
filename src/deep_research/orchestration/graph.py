@@ -28,7 +28,7 @@ class BoundedResearchGraph:
     MAX_REPAIR_ROUNDS = 2
     MAX_NODE_EXECUTIONS = 12
 
-    def __init__(self, *, execution_timeout_seconds: float = 2_700) -> None:
+    def __init__(self, *, execution_timeout_seconds: float = 1_200) -> None:
         builder = GraphBuilder()
         for node_id in (
             "clarifier",

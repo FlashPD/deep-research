@@ -73,6 +73,34 @@ class FakeResearcher:
         )
 
 
+def test_budget_clamp_never_goes_below_the_persisted_usage() -> None:
+    from deep_research.worker import _clamp_budget
+
+    plan = ResearchPlan.finalize(
+        draft=make_plan_draft(),
+        brief=ResearchBrief(topic="EV market"),
+        budget=BudgetLimits.for_preset(DepthPreset.DEEP),
+        version=1,
+    )
+    target = plan.budget.target_duration_seconds
+    fresh = _clamp_budget(
+        BudgetUsage(elapsed_seconds=target + 150, searches=3), plan, floor=BudgetUsage()
+    )
+    assert fresh.elapsed_seconds == target, "a first overshoot is clamped to the target"
+
+    # The review phase already pushed the persisted value past the target; a later research
+    # checkpoint must not try to lower it (the control plane rejects decreasing budgets).
+    persisted = BudgetUsage(elapsed_seconds=target + 100, searches=40, fetched_sources=60)
+    later = _clamp_budget(
+        BudgetUsage(elapsed_seconds=target + 160, searches=41, fetched_sources=61),
+        plan,
+        floor=persisted,
+    )
+    assert later.elapsed_seconds == target + 100
+    assert later.searches == 41
+    assert later.fetched_sources == 61
+
+
 def test_quick_initial_research_reserves_two_source_slots_for_repair() -> None:
     quick_plan = ResearchPlan.finalize(
         draft=make_plan_draft(),
@@ -506,6 +534,275 @@ async def test_stale_clarifier_cannot_overwrite_a_newer_revision() -> None:
     latest = await control.get_run(principal, run.run_id)
     assert latest.state is RunState.CLARIFYING
     assert latest.graph_checkpoint.clarification is None
+
+
+class ValidationFailingResearcher:
+    async def research(self, request, *, cancellation_check=None):
+        raise ValueError("research synthesis remained invalid after one repair")
+
+
+class OutputLimitPlanner:
+    async def create_plan(self, request, *, cancellation_check=None):
+        from deep_research.models.config import ModelProvider
+        from deep_research.models.gateway import ModelAttemptFailure, ModelInvocationError
+
+        raise ModelInvocationError(
+            "planner",
+            [
+                ModelAttemptFailure(
+                    target_name="anthropic_direct",
+                    provider=ModelProvider.ANTHROPIC,
+                    model_id="planner-model",
+                    attempt=1,
+                    max_attempts=2,
+                    error_type="MaxTokensReachedException",
+                    message="Model stopped generating due to maximum token limit.",
+                )
+            ],
+        )
+
+
+class BillingRejectedResearcher:
+    async def research(self, request, *, cancellation_check=None):
+        from deep_research.models.config import ModelProvider
+        from deep_research.models.gateway import ModelAttemptFailure, ModelInvocationError
+
+        raise ModelInvocationError(
+            "researcher",
+            [
+                ModelAttemptFailure(
+                    target_name="anthropic_direct",
+                    provider=ModelProvider.ANTHROPIC,
+                    model_id="research-model",
+                    attempt=1,
+                    max_attempts=2,
+                    error_type="BadRequestError",
+                    message=(
+                        "Error code: 400 - invalid_request_error: Your credit balance is too "
+                        "low to access the Anthropic API."
+                    ),
+                )
+            ],
+        )
+
+
+@pytest.mark.asyncio
+async def test_provider_rejection_fails_the_run_without_respending_research_budget() -> None:
+    principal = Principal(subject="user-1", tenant_id="tenant-1")
+    control = RunControlService(InMemoryRunRepository())
+    dispatcher = InMemoryJobDispatcher()
+    factory_calls: list[str] = []
+
+    def factory(_principal, run_id: str):
+        factory_calls.append(run_id)
+        return BillingRejectedResearcher()
+
+    agents = _agents([])
+    agents = WorkerAgents(
+        clarifier=agents.clarifier,
+        planner=agents.planner,
+        researcher_factory=factory,
+        reviewer=agents.reviewer,
+        report=agents.report,
+        questions=agents.questions,
+    )
+    worker = DurableWorker(control, dispatcher, agents, max_delivery_attempts=5)
+    run = await _approved_research_run(control, dispatcher, worker, principal)
+    await dispatcher.dispatch(make_phase_job(run, JobPhase.RESEARCH))
+
+    await worker.run_once(wait_seconds=1)
+
+    failed = await control.get_run(principal, run.run_id)
+    assert failed.state is RunState.FAILED
+    assert failed.failure_code == "model_provider_rejected"
+    assert "delivery_attempt=1/5" in failed.failure_message
+    assert "credit balance is too low" in failed.failure_message
+    assert dispatcher.pending == 0
+    assert len(factory_calls) == 1, "the research phase (and its searches) ran exactly once"
+
+
+@pytest.mark.asyncio
+async def test_model_output_limit_fails_the_run_without_redelivery() -> None:
+    principal = Principal(subject="user-1", tenant_id="tenant-1")
+    control = RunControlService(InMemoryRunRepository())
+    dispatcher = InMemoryJobDispatcher()
+    agents = _agents([])
+    agents = WorkerAgents(
+        clarifier=agents.clarifier,
+        planner=OutputLimitPlanner(),
+        researcher_factory=agents.researcher_factory,
+        reviewer=agents.reviewer,
+        report=agents.report,
+        questions=agents.questions,
+    )
+    worker = DurableWorker(control, dispatcher, agents, max_delivery_attempts=5)
+    run = await _started(control, principal)
+    await worker.handle(make_phase_job(run, JobPhase.CLARIFY))
+
+    await worker.run_once(wait_seconds=1)
+
+    failed = await control.get_run(principal, run.run_id)
+    assert failed.state is RunState.FAILED
+    assert failed.failure_code == "model_output_limit"
+    assert "delivery_attempt=1/5" in failed.failure_message
+    assert "MaxTokensReachedException" in failed.failure_message
+    assert dispatcher.pending == 0
+
+
+async def _approved_research_run(control, dispatcher, worker, principal):
+    run = await _started(control, principal)
+    await worker.handle(make_phase_job(run, JobPhase.CLARIFY))
+    planning = await dispatcher.receive(wait_seconds=1)
+    assert planning is not None
+    await worker.handle(planning.job)
+    run = await control.get_run(principal, run.run_id)
+    assert run.plan is not None
+    return await control.approve_plan(
+        principal,
+        run.run_id,
+        PlanApprovalRequest(version=run.plan.version, content_hash=run.plan.content_hash),
+        idempotency_key="approve-for-research",
+    )
+
+
+@pytest.mark.asyncio
+async def test_validation_errors_fail_the_run_on_the_first_delivery() -> None:
+    principal = Principal(subject="user-1", tenant_id="tenant-1")
+    control = RunControlService(InMemoryRunRepository())
+    dispatcher = InMemoryJobDispatcher()
+    agents = _agents([])
+    agents = WorkerAgents(
+        clarifier=agents.clarifier,
+        planner=agents.planner,
+        researcher_factory=lambda _principal, _run_id: ValidationFailingResearcher(),
+        reviewer=agents.reviewer,
+        report=agents.report,
+        questions=agents.questions,
+    )
+    worker = DurableWorker(control, dispatcher, agents, max_delivery_attempts=5)
+    run = await _approved_research_run(control, dispatcher, worker, principal)
+    await dispatcher.dispatch(make_phase_job(run, JobPhase.RESEARCH))
+
+    await worker.run_once(wait_seconds=1)
+
+    failed = await control.get_run(principal, run.run_id)
+    assert failed.state is RunState.FAILED
+    assert failed.failure_code == "worker_validation_error"
+    assert failed.failure_message == (
+        "phase=research; delivery_attempt=1/5; "
+        "ValueError: research synthesis remained invalid after one repair"
+    )
+    assert dispatcher.pending == 0, "deterministic failures are not redelivered"
+
+
+def _parallel_plan_draft():
+    draft = make_plan_draft()
+    second_question = draft.questions[0].model_copy(update={"id": "adoption_rate"})
+    second_workstream = draft.workstreams[0].model_copy(
+        update={
+            "id": "adoption_analysis",
+            "research_question_ids": ["adoption_rate"],
+            "dependencies": [],
+            "candidate_queries": ["official EV adoption statistics"],
+        }
+    )
+    return draft.model_copy(
+        update={
+            "questions": [*draft.questions, second_question],
+            "workstreams": [*draft.workstreams, second_workstream],
+            "outline": [
+                draft.outline[0].model_copy(
+                    update={"research_question_ids": ["market_size", "adoption_rate"]}
+                )
+            ],
+        }
+    )
+
+
+class OneWorkstreamFails(FakeResearcher):
+    async def research(self, request, *, cancellation_check=None):
+        if request.task.workstream_id == "adoption_analysis":
+            raise RuntimeError("provider hiccup on the second workstream")
+        return await super().research(request, cancellation_check=cancellation_check)
+
+
+@pytest.mark.asyncio
+async def test_completed_workstreams_are_checkpointed_before_a_wave_failure_surfaces() -> None:
+    principal = Principal(subject="user-1", tenant_id="tenant-1")
+    control = RunControlService(InMemoryRunRepository())
+    dispatcher = InMemoryJobDispatcher()
+    base = _agents([])
+    agents = WorkerAgents(
+        clarifier=base.clarifier,
+        planner=PlanningAgent(FakeGateway(_parallel_plan_draft())),
+        researcher_factory=lambda _principal, _run_id: OneWorkstreamFails([]),
+        reviewer=base.reviewer,
+        report=base.report,
+        questions=base.questions,
+    )
+    worker = DurableWorker(control, dispatcher, agents)
+    run = await _approved_research_run(control, dispatcher, worker, principal)
+
+    with pytest.raises(RuntimeError, match="second workstream"):
+        await worker.handle(make_phase_job(run, JobPhase.RESEARCH))
+
+    latest = await control.get_run(principal, run.run_id)
+    assert set(latest.graph_checkpoint.research_results) == {"workstream:market_analysis"}
+    assert latest.state is RunState.RESEARCHING
+    events = await control.get_events(principal, run.run_id)
+    completed = [e for e in events.events if e.event_type == "research.workstream.completed"]
+    assert [e.payload["workstream_id"] for e in completed] == ["market_analysis"]
+
+
+@pytest.mark.asyncio
+async def test_one_researcher_serves_every_parallel_workstream_in_a_phase() -> None:
+    principal = Principal(subject="user-1", tenant_id="tenant-1")
+    control = RunControlService(InMemoryRunRepository())
+    dispatcher = InMemoryJobDispatcher()
+    draft = make_plan_draft()
+    second_question = draft.questions[0].model_copy(update={"id": "adoption_rate"})
+    second_workstream = draft.workstreams[0].model_copy(
+        update={
+            "id": "adoption_analysis",
+            "research_question_ids": ["adoption_rate"],
+            "dependencies": [],
+            "candidate_queries": ["official EV adoption statistics"],
+        }
+    )
+    parallel_draft = draft.model_copy(
+        update={
+            "questions": [*draft.questions, second_question],
+            "workstreams": [*draft.workstreams, second_workstream],
+            "outline": [
+                draft.outline[0].model_copy(
+                    update={"research_question_ids": ["market_size", "adoption_rate"]}
+                )
+            ],
+        }
+    )
+    factory_calls: list[str] = []
+    research_calls: list[str] = []
+
+    def counting_factory(_principal, run_id: str):
+        factory_calls.append(run_id)
+        return FakeResearcher(research_calls)
+
+    base = _agents([])
+    agents = WorkerAgents(
+        clarifier=base.clarifier,
+        planner=PlanningAgent(FakeGateway(parallel_draft)),
+        researcher_factory=counting_factory,
+        reviewer=base.reviewer,
+        report=base.report,
+        questions=base.questions,
+    )
+    worker = DurableWorker(control, dispatcher, agents)
+    run = await _approved_research_run(control, dispatcher, worker, principal)
+
+    await worker.handle(make_phase_job(run, JobPhase.RESEARCH))
+
+    assert set(research_calls) == {"market_analysis", "adoption_analysis"}
+    assert factory_calls == [run.run_id], "the run-bound adapter (and its page cache) is shared"
 
 
 @pytest.mark.asyncio

@@ -3,6 +3,7 @@ from dataclasses import dataclass
 
 from deep_research.contracts.research import UploadChunk, UploadSearchOperation
 from deep_research.settings import AppSettings
+from deep_research.tools.page_cache import CachingPageFetcher
 from deep_research.tools.playwright_fetcher import PlaywrightPageFetcher
 from deep_research.tools.research import (
     ComposedResearchAdapter,
@@ -60,7 +61,11 @@ def build_live_research_services(
             settings.tavily_api_key.get_secret_value(),
             base_url=settings.tavily_base_url,
         ),
-        page_fetcher=PlaywrightPageFetcher(headless=settings.playwright_headless),
+        # One capture per canonical URL for the lifetime of these services (one research
+        # phase), so parallel workstreams never disagree about a shared source.
+        page_fetcher=CachingPageFetcher(
+            PlaywrightPageFetcher(headless=settings.playwright_headless)
+        ),
         upload_search=upload_search,
     )
     return LiveResearchServices(research_adapter=research_adapter)

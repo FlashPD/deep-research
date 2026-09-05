@@ -3,7 +3,7 @@ import hashlib
 import pytest
 from pydantic import ValidationError
 
-from deep_research.agents.report import ReportGenerationAgent, ReportValidationError
+from deep_research.agents.report import ReportGenerationAgent
 from deep_research.agents.reviewer import EvidenceReviewer
 from deep_research.contracts.evidence import ReviewerRequest, ReviewState
 from deep_research.contracts.planning import DepthPreset
@@ -84,7 +84,9 @@ async def test_invalid_mermaid_is_omitted_after_one_repair() -> None:
 
     assert "```mermaid" not in artifact.markdown
     assert "Diagram omitted under strict validation" in artifact.markdown
-    assert artifact.mermaid_validation[0].valid is False
+    # The worker refuses to finalize an artifact carrying any invalid diagram record, so an
+    # omitted diagram must leave no validation entry behind.
+    assert artifact.mermaid_validation == []
 
 
 @pytest.mark.asyncio
@@ -143,14 +145,21 @@ async def test_report_request_rejects_review_for_different_evidence() -> None:
 
 
 @pytest.mark.asyncio
-async def test_report_remains_blocked_after_bad_citation_repair() -> None:
+async def test_hard_validation_failure_after_repair_uses_deterministic_report() -> None:
     bad = make_report_draft(content="The market doubled without a citation.")
+    gateway = FakeGateway(bad, bad)
     request = ReportRequest(
         plan=make_plan(), evidence=make_evidence_package(), review=await _approved_review()
     )
 
-    with pytest.raises(ReportValidationError):
-        await ReportGenerationAgent(FakeGateway(bad, bad)).generate(request)
+    artifact = await ReportGenerationAgent(gateway).generate(request)
+
+    assert len(gateway.calls) == 2
+    assert artifact.generation_metadata.prompt_version.endswith("deterministic-fallback")
+    assert "failed validation after one repair" in artifact.markdown
+    assert "lacks a citation" in artifact.markdown
+    assert "[S1]" in artifact.markdown
+    assert "The market doubled without a citation." not in artifact.markdown
 
 
 def _output_limit_error() -> ModelInvocationError:
@@ -207,7 +216,7 @@ async def test_second_output_limit_uses_deterministic_cited_report() -> None:
 
 
 @pytest.mark.asyncio
-async def test_quick_report_rejects_oversized_sections() -> None:
+async def test_quick_report_still_asks_for_one_repair_when_oversized() -> None:
     plan = make_plan(preset=DepthPreset.QUICK)
     evidence = make_evidence_package()
     review = await EvidenceReviewer(FakeGateway(make_review_draft())).review(
@@ -216,7 +225,116 @@ async def test_quick_report_rejects_oversized_sections() -> None:
     oversized = make_report_draft(
         content=("Measured market growth remained positive. [S1]\n\n" * 50)
     )
+    gateway = FakeGateway(oversized, make_report_draft())
     request = ReportRequest(plan=plan, evidence=evidence, review=review)
 
-    with pytest.raises(ReportValidationError, match="exceeds 1800 characters"):
-        await ReportGenerationAgent(FakeGateway(oversized, oversized)).generate(request)
+    artifact = await ReportGenerationAgent(gateway).generate(request)
+
+    assert len(gateway.calls) == 2
+    assert "exceeds 1800 characters" in gateway.calls[1]["prompt"]
+    assert "trimming" not in artifact.markdown
+
+
+@pytest.mark.asyncio
+async def test_quick_report_trims_oversized_prose_after_one_repair() -> None:
+    plan = make_plan(preset=DepthPreset.QUICK)
+    evidence = make_evidence_package()
+    review = await EvidenceReviewer(FakeGateway(make_review_draft())).review(
+        ReviewerRequest(plan=plan, evidence=evidence)
+    )
+    long_methodology = " ".join(
+        f"Step {index} synthesized the supplied normalized evidence carefully."
+        for index in range(20)
+    )
+    assert len(long_methodology) > 600
+    oversized = make_report_draft(
+        content=("Measured market growth remained positive. [S1]\n\n" * 50)
+    ).model_copy(update={"methodology": long_methodology})
+    gateway = FakeGateway(oversized, oversized)
+    request = ReportRequest(plan=plan, evidence=evidence, review=review)
+
+    artifact = await ReportGenerationAgent(gateway).generate(request)
+
+    assert len(gateway.calls) == 2
+    assert artifact.generation_metadata.prompt_version == "report-v2"
+    methodology = artifact.markdown.split("## Methodology\n\n")[1].split("\n\n## ")[0]
+    assert len(methodology) <= 600
+    assert methodology.endswith("carefully.")
+    section = artifact.markdown.split("## Market findings\n\n")[1].split("\n\n## ")[0]
+    assert len(section) <= 1800
+    assert section.count("[S1]") >= 1
+    assert "trimming the methodology, section 'Market findings'" in artifact.markdown
+    assert artifact.cited_source_ids == ["S1"]
+
+
+def test_multi_id_brackets_are_split_into_one_citation_per_bracket() -> None:
+    from deep_research.agents.report import _split_multi_citations
+
+    assert _split_multi_citations("Fact. [S1, S2]") == "Fact. [S1] [S2]"
+    assert _split_multi_citations("Fact. [S10,S20;S30 / S40]") == "Fact. [S10] [S20] [S30] [S40]"
+    assert _split_multi_citations("Fact. [S1] [S2]") == "Fact. [S1] [S2]", "already canonical"
+    assert _split_multi_citations("Fact. [S1]") == "Fact. [S1]"
+    assert _split_multi_citations("[S1, bogus]") == "[S1, bogus]", "non-ID content untouched"
+
+
+@pytest.mark.asyncio
+async def test_report_accepts_multi_source_brackets_without_falling_back() -> None:
+    from deep_research.contracts.evidence import EvidenceExcerpt, SourceRecord, SourceType
+
+    evidence = make_evidence_package()
+    second_source = SourceRecord(
+        source_id="S2",
+        source_type=SourceType.WEB_PAGE,
+        title="Independent EV review",
+        access_date="2026-08-26",
+        canonical_url="https://example.org/ev-review",
+        content_hash="c" * 64,
+    )
+    second_excerpt = EvidenceExcerpt(
+        evidence_id="E2", source_id="S2", excerpt="Sales grew a fifth.", location="p. 2"
+    )
+    evidence = evidence.model_copy(
+        update={
+            "sources": [*evidence.sources, second_source],
+            "excerpts": [*evidence.excerpts, second_excerpt],
+            "claims": [evidence.claims[0].model_copy(update={"evidence_ids": ["E1", "E2"]})],
+        }
+    )
+    review_draft = make_review_draft()
+    review_draft = review_draft.model_copy(
+        update={
+            "source_scores": [
+                *review_draft.source_scores,
+                review_draft.source_scores[0].model_copy(update={"source_id": "S2"}),
+            ]
+        }
+    )
+    review = await EvidenceReviewer(FakeGateway(review_draft)).review(
+        ReviewerRequest(plan=make_plan(), evidence=evidence)
+    )
+    draft = make_report_draft(content="EV sales increased by 20 percent in 2025. [S1, S2]")
+    gateway = FakeGateway(draft)
+    request = ReportRequest(plan=make_plan(), evidence=evidence, review=review)
+
+    artifact = await ReportGenerationAgent(gateway).generate(request)
+
+    assert len(gateway.calls) == 1
+    assert artifact.generation_metadata.prompt_version == "report-v2"
+    assert "[S1] [S2]" in artifact.markdown
+    assert artifact.cited_source_ids == ["S1", "S2"]
+
+
+def test_trimmed_paragraph_keeps_its_own_citation() -> None:
+    from deep_research.agents.report import _trim_paragraph
+
+    paragraph = (
+        "Peak brightness reached a measured value in the review lab. " * 22
+        + "Colour volume was also strong. [S1]"
+    )
+    assert len(paragraph) > 1_200
+
+    trimmed = _trim_paragraph(paragraph, 1_200)
+
+    assert len(trimmed) <= 1_200
+    assert trimmed.endswith(". [S1]")
+    assert "[S1] " not in trimmed, "citation appears exactly once, at the end"

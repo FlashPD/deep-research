@@ -16,6 +16,30 @@ _OUTPUT_LIMIT_ERROR_TYPES = {
     "LengthFinishReasonError",
     "MaxTokensReachedException",
 }
+# Provider responses that will not change on retry: malformed requests, missing or revoked
+# credentials, exhausted billing, unknown models. Rate limits and 5xx are deliberately absent.
+_PROVIDER_REJECTION_ERROR_TYPES = {
+    "AuthenticationError",
+    "BadRequestError",
+    "NotFoundError",
+    "PermissionDeniedError",
+    "UnprocessableEntityError",
+}
+_PROVIDER_REJECTION_MARKERS = (
+    "credit balance",
+    "invalid_request_error",
+    "authentication_error",
+    "permission_error",
+    "not_found_error",
+    "invalid api key",
+    "invalid x-api-key",
+    "accessdeniedexception",
+    "unrecognizedclientexception",
+    "expiredtokenexception",
+    "invalidsignatureexception",
+    "validationexception",
+    "resourcenotfoundexception",
+)
 
 
 class StructuredModelGateway(Protocol):
@@ -118,7 +142,10 @@ class ModelGateway:
                         failure.message or "<no detail>",
                     )
                     logger.debug("model invocation traceback", exc_info=True)
-                    if is_output_limit_failure(failure):
+                    if is_output_limit_failure(failure) or is_provider_rejection_failure(
+                        failure
+                    ):
+                        # Retrying the same target cannot help; fall through to the next one.
                         break
         raise ModelInvocationError(role, failures)
 
@@ -212,4 +239,23 @@ def is_output_limit_failure(failure: ModelAttemptFailure) -> bool:
 def is_output_limit_error(error: ModelInvocationError) -> bool:
     return bool(error.failures) and any(
         is_output_limit_failure(failure) for failure in error.failures
+    )
+
+
+def is_provider_rejection_failure(failure: ModelAttemptFailure) -> bool:
+    detail = failure.message.casefold()
+    return failure.error_type in _PROVIDER_REJECTION_ERROR_TYPES or any(
+        marker in detail for marker in _PROVIDER_REJECTION_MARKERS
+    )
+
+
+def is_provider_rejection_error(error: ModelInvocationError) -> bool:
+    """True when no configured target can succeed by retrying the same request.
+
+    Every attempt must have been a deterministic rejection (or an output-limit stop); a single
+    transient failure among the attempts keeps the error retryable.
+    """
+    return bool(error.failures) and all(
+        is_provider_rejection_failure(failure) or is_output_limit_failure(failure)
+        for failure in error.failures
     )

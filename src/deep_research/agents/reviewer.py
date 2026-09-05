@@ -114,9 +114,11 @@ class EvidenceReviewer:
             and not budget_exhausted
         )
 
-        if has_material_gap and can_retry and not draft.retry_tasks:
-            raise ValueError("material evidence gaps require at least one targeted retry task")
-        if has_material_gap and can_retry:
+        # A gap with retries remaining but no proposed retry task is the reviewer's judgment
+        # that another search cannot close it (paywalled measurements, discontinued models).
+        # That is recorded as a limitation rather than rejected as an invalid review.
+        unrepairable_gap = has_material_gap and can_retry and not draft.retry_tasks
+        if has_material_gap and can_retry and draft.retry_tasks:
             state = ReviewState.REPAIR_REQUIRED
             retry_tasks = draft.retry_tasks
         elif has_material_gap and not has_evidence_backed_claim:
@@ -130,6 +132,11 @@ class EvidenceReviewer:
             retry_tasks = []
 
         limitations = list(draft.limitations)
+        if unrepairable_gap:
+            limitations.append(
+                "The reviewer identified remaining evidence gaps but proposed no repair task "
+                "within the approved scope; they are recorded as limitations."
+            )
         if state in {ReviewState.APPROVED_WITH_LIMITATIONS, ReviewState.REJECTED}:
             generated = [*deterministic_issues]
             generated.extend(
@@ -243,10 +250,24 @@ class EvidenceReviewer:
                 f"{allowed_queries} allowed; adaptive capacity requires two independent tasks"
             )
 
+    @classmethod
+    def _deterministic_evidence_issues(cls, request: ReviewerRequest) -> list[str]:
+        return [
+            *cls._coverage_issues(request),
+            *cls._integrity_issues(request),
+        ]
+
     @staticmethod
-    def _deterministic_evidence_issues(request: ReviewerRequest) -> list[str]:
+    def _coverage_issues(request: ReviewerRequest) -> list[str]:
+        """Questions and evidence-bearing sections without a backed claim.
+
+        Narrative sections that map no research question (introductions, verdicts) can never
+        receive a claim by construction, so they are not coverage gaps.
+        """
         question_ids = {item.id for item in request.plan.questions}
-        section_ids = {item.id for item in request.plan.outline}
+        evidence_section_ids = {
+            item.id for item in request.plan.outline if item.research_question_ids
+        }
         issues: list[str] = []
         evidence_backed_questions = {
             claim.research_question_id for claim in request.evidence.claims if claim.evidence_ids
@@ -259,8 +280,16 @@ class EvidenceReviewer:
         }
         for question_id in sorted(question_ids - evidence_backed_questions):
             issues.append(f"Research question {question_id} has no evidence-backed claim.")
-        for section_id in sorted(section_ids - evidence_backed_sections):
+        for section_id in sorted(evidence_section_ids - evidence_backed_sections):
             issues.append(f"Report section {section_id} has no evidence-backed claim.")
+        return issues
+
+    @staticmethod
+    def _integrity_issues(request: ReviewerRequest) -> list[str]:
+        """Structural problems that make the package unsafe to report on at all."""
+        question_ids = {item.id for item in request.plan.questions}
+        section_ids = {item.id for item in request.plan.outline}
+        issues: list[str] = []
         if len(request.evidence.sources) > request.plan.budget.max_accepted_sources:
             issues.append("The evidence package exceeds the approved accepted-source ceiling.")
         for claim in request.evidence.claims:
@@ -304,6 +333,7 @@ class EvidenceReviewer:
         """Build a conservative review when semantic review infrastructure is unavailable."""
         evidence = request.evidence
         issues = cls._deterministic_evidence_issues(request)
+        integrity_issues = cls._integrity_issues(request)
         backed_questions = {
             claim.research_question_id for claim in evidence.claims if claim.evidence_ids
         }
@@ -314,7 +344,9 @@ class EvidenceReviewer:
             for section_id in claim.section_ids
         }
         has_backed_claim = any(claim.evidence_ids for claim in evidence.claims)
-        safe_for_partial_report = has_backed_claim and not issues
+        # Coverage gaps become limitations of a partial report; only structural corruption
+        # or a package with no backed claim at all is unsafe to report on.
+        safe_for_partial_report = has_backed_claim and not integrity_issues
         error_detail = " ".join(str(error).split())[:240] or type(error).__name__
         limitations = [
             (

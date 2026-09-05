@@ -145,3 +145,97 @@ async def test_gateway_does_not_retry_same_target_after_output_limit(
 
     assert OutputLimitedAgent.calls == 1
     assert len(exc_info.value.failures) == 1
+
+
+class BillingRejectedAgent:
+    calls = 0
+
+    def __init__(self, **_kwargs: Any) -> None:
+        pass
+
+    async def invoke_async(self, *_args: Any, **_kwargs: Any) -> Any:
+        type(self).calls += 1
+        error_type = type("BadRequestError", (RuntimeError,), {})
+        raise error_type(
+            "Error code: 400 - {'type': 'error', 'error': {'type': 'invalid_request_error', "
+            "'message': 'Your credit balance is too low to access the Anthropic API.'}}"
+        )
+
+
+@pytest.mark.asyncio
+async def test_gateway_does_not_retry_same_target_after_provider_rejection(
+    monkeypatch: Any,
+) -> None:
+    from deep_research.models.gateway import is_provider_rejection_error
+
+    BillingRejectedAgent.calls = 0
+    settings = ModelSettings.model_validate(
+        {
+            "targets": {
+                "primary": {
+                    "provider": "anthropic",
+                    "model_id": "primary-model",
+                    "max_attempts": 3,
+                },
+                "fallback": {
+                    "provider": "openai",
+                    "model_id": "fallback-model",
+                    "max_attempts": 3,
+                },
+            },
+            "roles": {"researcher": ["primary", "fallback"]},
+        }
+    )
+    monkeypatch.setattr(ModelGateway, "_create_model", staticmethod(lambda _target: object()))
+    gateway = ModelGateway(settings, agent_factory=BillingRejectedAgent)
+
+    with pytest.raises(ModelInvocationError) as exc_info:
+        await gateway.generate_structured(
+            role="researcher",
+            prompt="Synthesize",
+            output_type=ClarificationDecision,
+            system_prompt="Return structured output",
+        )
+
+    # One attempt per target: the rejection is deterministic, but a fallback provider may
+    # still succeed, so the gateway moves on instead of retrying the same target.
+    assert BillingRejectedAgent.calls == 2
+    assert [failure.target_name for failure in exc_info.value.failures] == ["primary", "fallback"]
+    assert is_provider_rejection_error(exc_info.value)
+
+
+def test_transient_failures_keep_the_error_retryable() -> None:
+    from deep_research.models.config import ModelProvider
+    from deep_research.models.gateway import (
+        ModelAttemptFailure,
+        is_provider_rejection_error,
+        is_provider_rejection_failure,
+    )
+
+    def failure(error_type: str, message: str) -> ModelAttemptFailure:
+        return ModelAttemptFailure(
+            target_name="t",
+            provider=ModelProvider.ANTHROPIC,
+            model_id="m",
+            attempt=1,
+            max_attempts=2,
+            error_type=error_type,
+            message=message,
+        )
+
+    rate_limited = failure("RateLimitError", "Error code: 429 - rate_limit_error")
+    overloaded = failure("InternalServerError", "Error code: 529 - overloaded_error")
+    timed_out = failure("TimeoutError", "")
+    rejected = failure("AuthenticationError", "Error code: 401 - invalid x-api-key")
+    bedrock_denied = failure(
+        "ClientError", "An error occurred (AccessDeniedException) when calling"
+    )
+
+    assert not is_provider_rejection_failure(rate_limited)
+    assert not is_provider_rejection_failure(overloaded)
+    assert not is_provider_rejection_failure(timed_out)
+    assert is_provider_rejection_failure(rejected)
+    assert is_provider_rejection_failure(bedrock_denied)
+    assert not is_provider_rejection_error(ModelInvocationError("r", [rejected, rate_limited]))
+    assert is_provider_rejection_error(ModelInvocationError("r", [rejected, bedrock_denied]))
+    assert not is_provider_rejection_error(ModelInvocationError("r", []))

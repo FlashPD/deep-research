@@ -17,6 +17,11 @@ class AppSettings(BaseSettings):
     model_fallback_order: str = ""
     openai_api_key: SecretStr | None = None
     anthropic_api_key: SecretStr | None = None
+    # Model IDs are consumed by config/models.yaml through ${VAR:-default} expansion. They are
+    # declared here so values in .env reach the YAML (see load_models) instead of being ignored.
+    openai_model_id: str | None = None
+    anthropic_model_id: str | None = None
+    default_model_id: str | None = None
     tavily_api_key: SecretStr | None = None
     tavily_base_url: str = "https://api.tavily.com"
     playwright_headless: bool = True
@@ -42,7 +47,17 @@ class AppSettings(BaseSettings):
     aws_region: str = "us-east-1"
 
     def load_models(self) -> ModelSettings:
-        configured = ModelSettings.from_yaml(self.model_config_path)
+        yaml_overrides = {
+            name: value
+            for name, value in {
+                "OPENAI_MODEL_ID": self.openai_model_id,
+                "ANTHROPIC_MODEL_ID": self.anthropic_model_id,
+                "DEFAULT_MODEL_ID": self.default_model_id,
+                "AWS_REGION": self.aws_region,
+            }.items()
+            if value
+        }
+        configured = ModelSettings.from_yaml(self.model_config_path, overrides=yaml_overrides)
         fallbacks = [
             ModelProvider(item.strip())
             for item in self.model_fallback_order.split(",")

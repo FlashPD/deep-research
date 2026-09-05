@@ -2,7 +2,13 @@ from argparse import Namespace
 
 import pytest
 
-from deep_research.cli import _prompt_for_answer, run_cli
+from deep_research.cli import (
+    INPUT_CLOSED_MESSAGE,
+    NON_INTERACTIVE_MESSAGE,
+    _prompt_for_answer,
+    main,
+    run_cli,
+)
 from deep_research.client.polling import RunEventPoller
 from deep_research.contracts.clarification import (
     AnswerType,
@@ -155,3 +161,61 @@ async def test_cli_keyboard_interrupt_cooperatively_cancels_run(tmp_path) -> Non
     assert exit_code == 130
     assert cancelled.state is RunState.CANCELLED
     assert any("Cancellation requested" in line for line in output)
+
+
+@pytest.mark.asyncio
+async def test_cli_closed_stdin_cancels_the_run_with_a_clear_message(tmp_path) -> None:
+    repository = InMemoryRunRepository()
+    dispatcher = InMemoryJobDispatcher()
+    control = RunControlService(repository)
+    base_agents = _agents([])
+    worker = DurableWorker(
+        control,
+        dispatcher,
+        WorkerAgents(
+            clarifier=RecordingClarifier(),
+            planner=base_agents.planner,
+            researcher_factory=base_agents.researcher_factory,
+            reviewer=base_agents.reviewer,
+            report=base_agents.report,
+            questions=base_agents.questions,
+        ),
+    )
+    runtime = LocalDevelopmentRuntime(
+        settings=AppSettings(),
+        repository=repository,
+        dispatcher=dispatcher,
+        control=control,
+        gateway=FakeGateway(),
+        worker=worker,
+    )
+    output: list[str] = []
+    args = Namespace(
+        topic="Ambiguous EV market",
+        depth="quick",
+        provider=None,
+        output=tmp_path,
+        auto_approve_plan=True,
+    )
+
+    def closed_stdin(_prompt: str) -> str:
+        raise EOFError
+
+    exit_code = await run_cli(args, runtime, input_fn=closed_stdin, output_fn=output.append)
+    run_id = output[0].split()[1]
+    cancelled = await control.get_run(
+        Principal(subject="local-user", tenant_id="local-tenant"), run_id
+    )
+
+    assert exit_code == 2
+    assert cancelled.state is RunState.CANCELLED
+    assert INPUT_CLOSED_MESSAGE in output
+    assert not list(tmp_path.glob("*.md"))
+
+
+def test_main_refuses_to_start_without_a_terminal_unless_auto_approving(capsys) -> None:
+    with pytest.raises(SystemExit) as exit_info:
+        main(["Some topic", "--depth", "quick"], stdin_is_tty=False)
+
+    assert exit_info.value.code == 2
+    assert NON_INTERACTIVE_MESSAGE in capsys.readouterr().err
