@@ -1,47 +1,320 @@
 # Deep Research
 
-Python 3.13 backend foundation for the architecture in
-[`arch_plan/deep-research-system-plan.md`](arch_plan/deep-research-system-plan.md).
+**A production-grade, multi-agent deep-research system that turns a one-line question into an
+evidence-backed, citation-verified Markdown report, with a human approving the plan before a
+single web request is made.**
 
-Implemented so far:
+Python 3.13 · AWS Strands Agents · FastAPI · Pydantic v2 · Playwright · Tavily ·
+Anthropic / OpenAI / Amazon Bedrock · DynamoDB / SQS adapters · Cognito JWT auth ·
+162 mocked tests + opt-in live suite
 
-- typed clarification and normalized research-brief contracts;
-- a three-round, no-tools Clarifier Agent with explicit final confirmation;
-- a no-tools Planning Agent with validated workstream DAGs and fixed depth ceilings;
-- a bounded Research Agent with approved workstream tasks, typed operation planning, run-bound
-  adapter interfaces, fetched-source enforcement, exact-excerpt validation, and stable evidence IDs;
-- deterministic plan versions and canonical SHA-256 approval hashes;
-- a no-tools Questions Agent producing report-linked, prioritized follow-up topics;
-- a bounded Evidence Reviewer with source scoring, deterministic coverage checks, targeted repair
-  tasks, budget-aware retry ceilings, and explicit exhausted-budget limitations;
-- a Report Generation Agent with evidence-bound reviews, claim-mapped citation validation,
-  deterministic Markdown assembly and source appendices, checksums, and strict Mermaid degradation;
-- configuration-driven Bedrock, Anthropic, and OpenAI Strands model routing;
-- whole-operation retries and provider fallback without mixing partial outputs;
-- an authenticated run control plane with validated lifecycle transitions, exact plan approval,
-  idempotent commands, optimistic concurrency, cancellation, budgets, and replayable events;
-- tenant/owner-aware in-memory and DynamoDB repositories with 30-day TTL metadata;
-- a versioned phase-job protocol with acknowledged in-memory and SQS dispatch adapters;
-- a durable worker with optimistic, idempotent graph checkpoints, bounded parallel workstreams,
-  cooperative cancellation, monotonic usage accounting, and deterministic finalization;
-- Cognito access-token verification with cached JWKS, issuer, signature, app-client, token-use,
-  expiry, identity, and scope checks;
-- FastAPI command endpoints that persist and dispatch work, plus opt-in agent debug endpoints;
-- a local CLI that performs clarification, approval, progress polling, cancellation, and report
-  writing through the same control-plane and worker boundaries as the API;
-- a phase-scoped page cache so parallel workstreams share one capture per URL, plus tolerant
-  evidence merging when a dynamic page hashes differently between fetches;
-- fail-fast worker classification for deterministic failures (validation errors, model output
-  limits, provider billing/credential rejections) so a doomed phase is never redelivered;
-- graceful report degradation: over-length quick prose is trimmed, unsafe diagrams become prose,
-  and a still-invalid draft falls back to a deterministic, fully cited evidence-mapped report;
-- credential-free mocked tests plus explicitly selected, bounded live tests.
+Give it `"Compare the Samsung S90D, LG C4, and Sony Bravia 8 for a 65-inch home theater"` and
+it will ask two clarifying questions, propose a versioned research plan for approval, fan out six
+parallel research workstreams over 41 web searches and 46 fetched pages, review 225 normalized
+claims, and write a 4,000-word report in which every `[S…]` citation resolves to a real captured
+source. Two finished runs are committed as [sample reports](#sample-reports).
 
-Two completed runs are checked in as examples; see [Sample reports](#sample-reports).
+---
 
-## Fresh-machine local setup
+## Contents
 
-The package requires Python 3.13. From the repository root:
+- [Why this project](#why-this-project)
+- [Capabilities](#capabilities)
+- [How a run works](#how-a-run-works)
+- [Multi-agent architecture](#multi-agent-architecture)
+- [Evidence integrity model](#evidence-integrity-model)
+- [Reliability and operations](#reliability-and-operations)
+- [Security model](#security-model)
+- [Sample reports](#sample-reports)
+- [Quickstart](#quickstart)
+- [CLI reference](#cli-reference)
+- [Configuration](#configuration)
+- [HTTP API](#http-api)
+- [Testing](#testing)
+- [Troubleshooting](#troubleshooting)
+- [Project layout](#project-layout)
+- [Roadmap](#roadmap)
+
+---
+
+## Why this project
+
+Most "deep research" demos are a single agent in a tool-calling loop: it searches, reads, and
+writes, and you trust whatever it says. That approach fails in exactly the places that matter for
+real use: it hallucinates citations, it spends unbounded money and time, it cannot be paused for
+human approval, it forgets everything if the process dies, and it treats every web page it reads
+as trusted instructions.
+
+This project takes the opposite stance. It is a **bounded, typed, durable multi-agent workflow**
+in which:
+
+- **Agents never hold tools or credentials.** Each agent returns a validated Pydantic model. The
+  application decides what to execute, with run-bound adapters that carry the tenant and run
+  identity so a model can never pick a different index, browser session, or key.
+- **Nothing becomes evidence unless the application fetched it.** Search snippets are discovery
+  metadata only. Every claim must select exact excerpt segments from pages the system opened
+  itself, and every citation in the final report is validated against that chain.
+- **Humans stay in the loop at the two points that matter:** clarification before planning and
+  approval of the exact plan (version plus SHA-256 hash) before any research spend.
+- **Every phase is a checkpointed job.** A run survives process restarts, duplicate queue
+  deliveries, and cooperative cancellation, and it resumes from the last completed node.
+- **Failure is classified, not retried blindly.** Deterministic failures (validation, output
+  ceilings, exhausted billing) fail fast with a distinct code; transient ones are retried; a
+  report that loses its prose still ships as a fully cited deterministic fallback.
+
+It was designed from an [architecture plan](arch_plan/deep-research-system-plan.md) written
+first, then implemented and hardened by running quick and deep research end to end against the
+live web until both completed.
+
+---
+
+## Capabilities
+
+### Research quality
+
+- **Clarify → plan → approve → research → review → report → follow-ups**, each stage a
+  separate agent with a typed contract and no access to the others' prompts.
+- **Adaptive clarification**: up to three rounds of typed questions (free text, single-select,
+  multi-select, confirmation, date range), collapsing to a best-interpretation confirmation.
+- **Versioned, hash-approved plans** with research questions, an acyclic workstream DAG,
+  per-workstream candidate queries, source-priority strategy, report outline, and budget.
+- **Parallel research workstreams** executed in dependency waves under the plan's concurrency
+  limit, each producing normalized claims bound to exact evidence segments.
+- **An internal evidence reviewer** that scores every source on authority, freshness,
+  relevance, independence, and accessibility; flags unsupported and overconfident claims;
+  surfaces contradictions; and issues *targeted* repair tasks (up to two rounds) that cannot
+  exceed the remaining query or source budget.
+- **Deterministic report assembly**: exact approved outline, per-section citation mapping,
+  reviewer limitations preserved verbatim, unresolved contradictions listed, a source appendix,
+  a SHA-256 checksum, and strict Mermaid validation with prose fallback.
+- **Follow-up question generation** linked to the completed report's sections.
+
+### Depth presets
+
+| Preset | Target duration | Search queries | Accepted sources | Parallel workstreams | Review repair rounds |
+|---|---|---|---|---|---|
+| `quick` | 5 min | 5 (+1 adaptive) | 10 | 3 | 1 |
+| `standard` | 15 min | 20 | 30 | 6 | 2 |
+| `deep` | 20 min | 50 | 75 | 10 | 2 |
+
+Ceilings are application-owned: the planner is told them, but the worker enforces them.
+
+### Platform
+
+- **Three model providers** (Anthropic, OpenAI, Amazon Bedrock) through one YAML-routed
+  gateway with per-role targets, whole-operation retries, and provider fallback that never mixes
+  partial outputs.
+- **A REST control plane** (FastAPI) with idempotent commands, optimistic concurrency,
+  replayable cursor-based events, and a Markdown report endpoint.
+- **A durable worker** with in-memory or SQS dispatch and in-memory or DynamoDB persistence,
+  sharing the same service boundaries as the API.
+- **A local CLI** that drives the whole workflow interactively (or unattended with
+  `--auto-approve-plan`) through those same boundaries.
+- **Cognito access-token verification** (JWKS cache, issuer, signature, client, token use,
+  expiry, scopes, tenant claim) with a fixed-identity development mode.
+- **Private document ingestion** (PDF, DOCX, TXT, Markdown): quarantine, magic-byte and
+  archive validation, fail-closed ClamAV scanning, location-preserving chunking, and
+  tenant/run-filtered OpenSearch retrieval.
+
+---
+
+## How a run works
+
+```mermaid
+flowchart TD
+    U([User submits topic]) --> C[Clarifier Agent]
+    C -->|typed questions| Q([User answers])
+    Q --> C
+    C -->|scope_ready: ResearchBrief| P[Planning Agent]
+    P --> A{{Plan approval interrupt<br/>version + SHA-256}}
+    A -->|reject| X([Run cancelled])
+    A -->|approve exact hash| R
+    subgraph R[Research phase — one isolated Research Agent per workstream]
+        direction LR
+        W1[Workstream 1] --- W2[Workstream 2] --- W3[Workstream n]
+    end
+    R -->|merged EvidencePackage| E[Evidence Reviewer]
+    E -->|repair_required: targeted tasks<br/>≤ 2 rounds, within budget| R
+    E -->|approved / approved_with_limitations| G[Report Generation Agent]
+    E -->|rejected: no backed claims| F([Run failed: insufficient_evidence])
+    G --> N[Questions Agent]
+    N --> Z[Deterministic finalization<br/>checksums, citation resolution]
+    Z --> D([Markdown report + follow-ups])
+```
+
+The run record, not an open connection, is the source of truth. States move
+`DRAFT → CLARIFYING → PLANNING → AWAITING_PLAN_APPROVAL → RESEARCHING → REVIEWING →
+GENERATING_REPORT → GENERATING_QUESTIONS → COMPLETED`, with `FAILED`, `CANCELLED`, and
+`EXPIRED` as terminal alternatives. Every transition persists a new run revision plus one
+immutable, ordered event, atomically with the idempotency response.
+
+What actually happens inside the research phase for one workstream:
+
+1. The approved candidate queries go to Tavily (discovery only; snippets are never evidence).
+2. Candidate URLs are canonicalized, de-duplicated, ranked (social-media hosts last), and fetched
+   through an isolated Playwright Chromium context with an SSRF guard, bounded redirects, size
+   and length ceilings, PDF text extraction, and a bounded settle wait for hydrated pages.
+3. Captured pages become *materials*, sliced into 1,500-character *evidence segments* with
+   short prompt-local IDs (`M1`, `G7`).
+4. The Research Agent, with no tools, synthesizes normalized claims that must cite those segment
+   IDs, stay inside the approved questions and sections, and respect a per-depth claim ceiling.
+5. The application validates every reference, drops anything invalid after one repair, and
+   mints stable content-derived IDs: sources from canonical URL, excerpts from source + location +
+   text, claims from question + sections + text. Parallel workstreams therefore merge without
+   coordination.
+
+---
+
+## Multi-agent architecture
+
+The system is a **deterministic, bounded graph**, not an autonomous swarm. Agents do not hand off
+to each other in free-form prose; the application routes typed payloads between them and owns
+every ceiling, retry, and state transition.
+
+| Agent | Input contract | Output contract | Tools | What the application enforces |
+|---|---|---|---|---|
+| Clarifier | `ClarifierRequest` (topic, prior answers, current brief, round) | `ClarificationDecision` | none | ≤ 5 questions/turn, ≤ 3 rounds, quick-depth caps, forced confirmation |
+| Planner | `PlannerRequest` (brief, depth, uploads, edits, previous plan) | `ResearchPlanDraft` → `ResearchPlan` | none | query/source ceilings, acyclic DAG, quick-mode shape limits, version + hash |
+| Researcher (×N) | `ResearchRequest` (plan, task, repair task, usage) | `ResearchSynthesisDraft` → `ResearchResult` | none (adapters run by app) | permitted tools, scope, segment references, claim ceiling, stable IDs |
+| Evidence Reviewer | `ReviewerRequest` (plan, evidence, usage, round) | `ReviewDraft` → `ReviewResult` | none | exact ID coverage, budget-bound repair tasks, deterministic coverage/integrity checks |
+| Report Generator | `ReportRequest` (plan, evidence, review, usage) | `ReportDraft` → `ReportArtifact` | none | exact outline, per-section citation mapping, limitations preserved, Mermaid safety, length ceilings |
+| Questions | `QuestionsRequest` (report context) | `FollowUpQuestionSet` | none | 5–10 prioritized, section-linked questions |
+
+Design choices worth noting:
+
+- **Structured output everywhere.** Every model call goes through one `ModelGateway` that asks
+  Strands for a Pydantic model as the response. There is no prose parsing anywhere in the
+  control path.
+- **Validate, repair once, then degrade.** Each agent gets exactly one repair prompt containing
+  the deterministic validation error. If the second attempt is still invalid, the system degrades
+  in a way that keeps integrity: drop the invalid claims, omit the unsafe diagram, trim the
+  over-length paragraph, or assemble the report deterministically from reviewed claims. It never
+  ships an unvalidated citation and never discards good work over a cosmetic failure.
+- **Strands `GraphBuilder` defines the topology and its bounds** (entry point, conditional edge
+  from reviewer back to research, node and execution timeouts, max node executions). A
+  `DurableWorker` executes each node as a checkpointed job so the graph's progress lives in the
+  run record rather than in process memory.
+- **One Research Agent instance per workstream, one adapter per phase.** Workstreams are
+  isolated but share a single-flight page cache, so a page that three queries surface is fetched
+  once and every workstream sees identical content.
+- **Untrusted content is labeled as such in every prompt.** Briefs, plans, page text, and
+  upload metadata are passed as "untrusted JSON" data, and every system prompt states that they
+  are never instructions.
+
+---
+
+## Evidence integrity model
+
+The claim you read in the report can be traced backwards without trusting any model:
+
+```
+report paragraph "[S421…]"  →  SourceRecord S421… (canonical URL, content hash, access date)
+        ↑ validated per section
+EvidenceClaim C…  →  evidence_ids [E…]  →  EvidenceExcerpt E… (verbatim segment, location)
+        ↑ must map to the section          ↑ derived from source + location + text
+ResearchSynthesisDraft claim  →  DraftEvidenceSelection (M3, G17)  →  CapturedMaterial M3
+        ↑ model-authored                    ↑ application-sliced from the fetched page
+```
+
+Guarantees enforced in code, each with tests:
+
+- A claim that is not an inference must select at least one captured segment, and every
+  selection must name a material and a segment that exist and belong together.
+- Source IDs are content-derived, so the same URL captured by two workstreams (or two repair
+  rounds) merges into one source; if a dynamic page hashed differently between captures, the
+  first capture wins and the source is flagged rather than the run failing.
+- The report may cite a source in a section only if some claim mapped to that section rests on
+  an excerpt from that source. Multi-source brackets like `[S1, S2]` are normalized; anything
+  else that looks like a citation but does not resolve is rejected.
+- Every material paragraph in a findings section, the executive summary, and the conclusion
+  needs a citation unless it is prefixed `Inference:` or `Analysis:`.
+- Reviewer limitations and contradictions must appear in the report verbatim.
+- Finalization re-verifies the review's evidence checksum, the report's plan hash, Mermaid
+  validity, and citation resolution before marking the run complete.
+
+---
+
+## Reliability and operations
+
+**Durable phase jobs.** Starting a run, answering clarification, and approving a plan each
+enqueue a typed `PhaseJob` bound to the run revision and, after approval, the exact plan version
+and hash. The worker checkpoints before the approval interrupt and after every completed
+workstream, so a replacement worker resumes from the canonical checkpoint and duplicate
+deliveries are absorbed by optimistic revisions and node-scoped idempotency keys.
+
+**Failure classification.** The worker decides per exception whether redelivery could help:
+
+| Failure code | Cause | Behavior |
+|---|---|---|
+| `worker_validation_error` | agent output or checkpoint failed a deterministic check | fail on first delivery |
+| `model_output_limit` | model stopped at its `max_tokens` ceiling | fail on first delivery |
+| `model_provider_rejected` | billing exhausted, bad credentials, invalid request | fail on first delivery, no budget re-spent |
+| `research_service_configuration` | plan needs a capability that is deliberately unconfigured | fail on first delivery |
+| `insufficient_evidence` | review found no evidence-backed claim | fail without generating a report |
+| `worker_retry_ceiling` | transient errors exhausted the delivery limit | fail after N deliveries |
+| `worker_conflict_ceiling` | persistent optimistic-concurrency conflicts | fail after N deliveries |
+
+**Budget accounting.** Elapsed time, searches, fetched sources, and model calls are recorded
+monotonically on every checkpoint, clamped to the plan's ceilings, and consulted before each
+research wave and review. Exhaustion produces explicit limitations rather than silently extending
+limits.
+
+**Cooperative cancellation.** A cancel request is persisted; every agent boundary and every
+research step checks it, and in-flight page fetches are released without cancelling sibling
+workstreams.
+
+**Observability.** `--verbose` (or standard logging configuration) emits the model route selected
+per role, every provider failure with attempt counts, and adapter failures, never prompts,
+evidence text, or keys. Worker events carry only safe metadata: phase, counts, checksums, budget
+totals.
+
+---
+
+## Security model
+
+- **SSRF guard on every browser request**, including sub-resources: HTTP(S) only, no embedded
+  credentials, standard ports only, no `localhost`/`.local`, DNS-resolved addresses must be
+  globally routable, redirects re-validated, image/media/font requests aborted. Verdicts are
+  cached per fetch so the guard does not become the bottleneck.
+- **Prompt-injection posture**: agents have no tools; fetched text and user-supplied metadata are
+  passed as data with explicit untrusted labels; nothing a page says can change scope, tools, or
+  identity because the application, not the model, owns those.
+- **Tenant isolation**: owner and tenant come from the authenticated principal, never from the
+  request body; every repository read is owner/tenant-scoped; upload retrieval injects
+  `tenant_id` and `run_id` filters server-side; research adapters are constructed per run.
+- **Credentials**: loaded from `.env` or the AWS credential chain by `pydantic-settings`, passed
+  directly to the provider client, never logged and never placed in a prompt.
+- **Uploads fail closed**: scanner unavailability or an indeterminate result blocks ingestion;
+  local artifacts are written with `0600` permissions into quarantine/original/extracted prefixes.
+
+---
+
+## Sample reports
+
+Two completed runs are committed under [`reports/`](reports/) exactly as the CLI wrote them.
+
+| Report | Depth | Topic | Run profile |
+|---|---|---|---|
+| [Quick research sample report](reports/Quick%20research%20sample%20report.md) | `quick` | "Give me a summary of Samsung's S90D TV" | 6.5 min · 2 workstreams · 5 cited sources · 1 repair round |
+| [Deep research sample report](reports/Deep%20research%20sample%20report.md) | `deep` | Samsung S90D vs LG C4 vs Sony Bravia 8 for a 65-inch home theater, model numbers pinned | 32 min · 6 parallel workstreams · 41 searches · 46 fetched sources · 225 reviewed claims · 36 cited sources |
+
+Read them with the integrity model above in mind: every `[S…]` resolves in the `Sources`
+section, the `Limitations` section is the reviewer's own list (paywalled measurements,
+discontinued models, anecdotal forum reports), and `Unresolved contradictions` names the
+claims that disagree and why.
+
+Both were produced by the **deterministic fallback path**: the model's prose draft failed a hard
+citation check twice (an uncited executive-summary paragraph in the quick run; `[S1, S2]`-style
+brackets in the deep run, which are now normalized before validation), so the report agent
+assembled each section directly from reviewed, evidence-backed claims. That is the system working
+as designed, favoring a verifiable claim list over unverifiable prose, and the reports say so in
+their own limitations.
+
+---
+
+## Quickstart
+
+Requires Python 3.13, a Tavily API key, and one model provider.
 
 ```bash
 python3.13 -m venv .venv
@@ -52,328 +325,205 @@ playwright install chromium
 cp .env.example .env
 ```
 
-Configure one provider in `.env`:
+Edit `.env` for one provider (model IDs set here are honored by `config/models.yaml`):
 
 ```dotenv
-# OpenAI
-MODEL_PROVIDER=openai
-OPENAI_API_KEY=replace-me
-OPENAI_MODEL_ID=gpt-5.4
-```
-
-```dotenv
-# Anthropic
-MODEL_PROVIDER=anthropic
+MODEL_PROVIDER=anthropic          # or openai | bedrock
 ANTHROPIC_API_KEY=replace-me
 ANTHROPIC_MODEL_ID=claude-sonnet-4-6
-```
-
-```dotenv
-# Amazon Bedrock; credentials still come from the standard AWS credential chain
-MODEL_PROVIDER=bedrock
-AWS_REGION=us-east-1
-DEFAULT_MODEL_ID=global.anthropic.claude-sonnet-4-6
-```
-
-For Bedrock, configure the AWS CLI/profile or exported AWS credential variables before starting.
-For every public-web provider, also set:
-
-```dotenv
 TAVILY_API_KEY=replace-me
 UPLOADS_ENABLED=false
 ```
 
-The [official OpenAI quickstart](https://developers.openai.com/api/docs/quickstart) recommends
-keeping `OPENAI_API_KEY` in a protected environment variable; this project additionally supports
-loading it from the uncommitted `.env` file and passes it directly to the server-side Strands
-client. Never commit `.env`.
-
-Start the API and worker together:
+For OpenAI use `OPENAI_API_KEY` / `OPENAI_MODEL_ID`; for Bedrock use the standard AWS credential
+chain with `AWS_REGION` / `DEFAULT_MODEL_ID`. Verify the toolchain without spending anything:
 
 ```bash
-deep-research-dev
+pytest                      # 162 mocked tests, no credentials needed
 ```
 
-The server listens on `http://127.0.0.1:8000`. Startup fails immediately when the selected direct
-provider key, Bedrock credential chain, or Tavily key is unavailable.
-
-Local setup defaults to `AUTH_MODE=development`, which injects a fixed local identity and must not
-be used in a shared or production deployment. Set `AUTH_MODE=cognito`, `COGNITO_ISSUER`, and
-`COGNITO_CLIENT_ID` to require Cognito bearer access tokens. The API always derives owner and tenant
-identity from the authenticated principal; run requests cannot supply either value.
-
-Model routes live in [`config/models.yaml`](config/models.yaml). Set `MODEL_PROVIDER` to `openai`,
-`anthropic`, or `bedrock`; OpenAI and Anthropic require their matching key, while Bedrock uses the
-normal AWS credential chain. `MODEL_FALLBACK_ORDER` optionally contains a comma-separated provider
-order. The selected provider is always first, so direct-provider development never probes Bedrock
-unless Bedrock is explicitly listed as a fallback. Keys loaded by `pydantic-settings` from `.env`
-are passed directly to the matching Strands client and are never logged. The model-ID variables
-(`OPENAI_MODEL_ID`, `ANTHROPIC_MODEL_ID`, `DEFAULT_MODEL_ID`, `AWS_REGION`) are read from `.env`
-too and substituted into the YAML's `${VAR:-default}` placeholders.
-
-Every target allows 16k output tokens with a 4-to-5-minute timeout. Deep-depth plans, syntheses,
-and reviews are large structured documents; a smaller ceiling makes the model stop mid-output and
-the run fails with `model_output_limit`.
-
-`deep-research-dev` is the single-process development runtime. It shares one in-memory repository,
-dispatcher, control service, gateway, and durable worker with FastAPI, and stops the background
-worker during application shutdown. It requires `TAVILY_API_KEY` at startup. The production
-`deep_research.api.app:app` and `deep-research-worker` composition roots remain separate.
-
-## Local end-to-end CLI
-
-The CLI owns an in-process local runtime but still creates commands through `RunControlService`,
-dispatches typed phase jobs, and lets `DurableWorker` invoke agents and research adapters.
+Run a quick piece of research interactively:
 
 ```bash
-deep-research-run "Compare grid-scale battery technologies" --depth quick
-deep-research-run "Research heat-pump adoption" --provider anthropic --output reports/
-deep-research-run "Summarize current fusion milestones" --auto-approve-plan
+deep-research-run "Give me a summary of Samsung's S90D TV" --depth quick --output reports/
 ```
 
-Supported options are:
-
-- `--depth quick|standard|deep` (default `standard`)
-- `--provider openai|anthropic|bedrock`, overriding `MODEL_PROVIDER` for that invocation
-- `--output PATH`, where a `.md` path is used directly and a directory receives `<run_id>.md`
-  (default directory `research-reports/`)
-- `--auto-approve-plan`, which is the only way to bypass the interactive approval prompt
-- `--verbose`, which logs model routing, provider fallbacks, and adapter failures to stderr
-
-Depth presets are fixed by the application and appear in the plan the CLI prints for approval:
-
-| Preset | Target duration | Search queries | Accepted sources | Parallel workstreams | Review repair rounds |
-|---|---|---|---|---|---|
-| `quick` | 5 min | 5 (+1 adaptive) | 10 | 3 | 1 |
-| `standard` | 15 min | 20 | 30 | 6 | 2 |
-| `deep` | 20 min | 50 | 75 | 10 | 2 |
-
-Quick runs typically finish in 6 to 9 minutes of wall time, deep runs in about 30 minutes. A
-deep run sends on the order of a million input tokens to the model provider (each workstream's
-synthesis carries up to 400k characters of fetched text), so keep credit headroom accordingly.
-
-The default flow displays typed clarification questions, submits answers for the current round,
-prints the generated plan, asks for approval of its exact version and SHA-256 hash, polls safe
-progress events, writes the completed Markdown report, and displays limitations and follow-up
-questions. Press Ctrl-C while work is running to persist a cooperative cancellation request.
-
-When stdin is not a terminal (piped input, CI, an editor task runner), the CLI refuses to start
-unless `--auto-approve-plan` is given, and cancels the run with exit code 2 if a clarification
-question still needs an answer. Parallel workstreams share one page capture per canonical URL
-for the duration of a research phase, so a page that appears in several candidate queries is
-fetched once and counted once per workstream.
-
-Reviewing the plan is worth the pause: rejecting it cancels the run, so if the planner has
-misidentified a product (for example, treating a model name as its predecessor), restart with the
-exact model numbers in the topic rather than approving and hoping the reviewer catches it.
-
-### Sample reports
-
-Two completed runs are committed under [`reports/`](reports/) as examples of the output format:
-
-- [`reports/Quick research sample report.md`](reports/Quick%20research%20sample%20report.md):
-  `--depth quick`, topic "Give me a summary of Samsung's S90D TV". About 6.5 minutes, 2
-  workstreams, 5 cited sources, one review repair round.
-- [`reports/Deep research sample report.md`](reports/Deep%20research%20sample%20report.md):
-  `--depth deep`, a three-way comparison of the Samsung S90D, LG C4, and Sony Bravia 8 with the
-  exact model numbers pinned in the topic. About 32 minutes, 6 parallel workstreams, 41 searches,
-  46 fetched sources, 225 reviewed claims, 36 cited sources.
-
-Both reports were produced by the deterministic fallback path: the model's prose draft failed a
-citation check twice (an uncited executive-summary paragraph in the quick run, multi-source
-brackets like `[S1, S2]` in the deep run, the latter now normalized before validation), so the
-report agent assembled the sections directly from reviewed, evidence-backed claims. The
-`Limitations` section of each report states this. Every `[S…]` citation resolves to an entry in
-the report's `Sources` section, and reviewer limitations, unresolved contradictions, and
-follow-up topics are preserved. New runs write to the `--output` directory; `reports/` ignores
-everything except the two samples.
-
-## Tests
-
-Mocked tests are deterministic and require no credentials:
+You will answer any clarification questions, see the generated plan, and be asked to approve its
+exact version and hash. Or run unattended:
 
 ```bash
-pytest
+deep-research-run "Summarize current fusion milestones" --depth quick --auto-approve-plan --verbose
 ```
 
-Live tests are excluded by default. After configuring the selected provider, Tavily, and Chromium,
-run them explicitly:
+Start the API and worker together for the HTTP surface:
 
 ```bash
-pytest -m live
+deep-research-dev           # http://127.0.0.1:8000
 ```
 
-The live suite uses Quick budgets and covers every model role, provider routing, Tavily followed by
-Playwright, clarification resume, exact approval, cancellation, a complete public-web workflow, and
-report citation resolution. Missing credentials cause clean skips.
+---
 
-## Expected workflow
+## CLI reference
 
-1. Create and start a run. The worker invokes the tool-free Clarifier.
-2. If questions are checkpointed, submit typed answers for that exact round. After three rounds,
-   proceeding requires explicit final confirmation. Quick depth asks at most two questions and
-   proceeds on the best available interpretation after the second round.
-3. Review the generated, versioned plan. No Tavily, Playwright, or upload operation occurs before
-   its exact version and hash are approved.
-4. Poll cursor-based events while research, review, report generation, and follow-up generation run.
-5. Read the completed report from the CLI output path or `GET /v1/runs/{run_id}/report`.
+```text
+deep-research-run TOPIC [--depth quick|standard|deep] [--provider openai|anthropic|bedrock]
+                        [--output PATH] [--auto-approve-plan] [--verbose]
+```
+
+- `--depth` defaults to `standard`; see the [presets table](#depth-presets).
+- `--provider` overrides `MODEL_PROVIDER` for that invocation.
+- `--output` is used directly if it ends in `.md`; a directory receives `<run_id>.md`
+  (default `research-reports/`).
+- `--auto-approve-plan` is the only way to skip the approval prompt. When stdin is not a
+  terminal the CLI refuses to start without it and exits 2 with a clear message; if a
+  clarification question still needs an answer it cancels the run cooperatively.
+- `--verbose` logs model routing, provider fallbacks, and adapter failures to stderr.
+- Ctrl-C persists a cooperative cancellation request.
+
+Reviewing the plan is worth the pause. Rejecting cancels the run, so if the planner has
+misidentified a product (treating a model name as its predecessor, say), restart with the exact
+model numbers in the topic. Quick runs typically finish in 6 to 9 minutes of wall time; deep runs
+in about 30 and send on the order of a million input tokens, so keep credit headroom.
+
+---
+
+## Configuration
+
+All settings load from `.env` (or the environment) through `pydantic-settings`; see
+[`.env.example`](.env.example) for the full list.
+
+| Setting | Purpose |
+|---|---|
+| `MODEL_PROVIDER`, `MODEL_FALLBACK_ORDER` | Primary provider and optional comma-separated fallback order. The selected provider is always tried first. |
+| `ANTHROPIC_API_KEY`, `OPENAI_API_KEY` | Direct-provider keys. Bedrock uses the AWS credential chain. |
+| `ANTHROPIC_MODEL_ID`, `OPENAI_MODEL_ID`, `DEFAULT_MODEL_ID`, `AWS_REGION` | Substituted into `config/models.yaml` placeholders. |
+| `TAVILY_API_KEY`, `TAVILY_BASE_URL`, `PLAYWRIGHT_HEADLESS` | Public-web research adapters. |
+| `AUTH_MODE`, `COGNITO_ISSUER`, `COGNITO_CLIENT_ID`, `COGNITO_REQUIRED_SCOPES`, `COGNITO_TENANT_CLAIM` | `development` injects a fixed local identity; `cognito` requires bearer access tokens. |
+| `DYNAMODB_RUNS_TABLE`, `SQS_JOBS_QUEUE_URL`, `RUN_RETENTION_DAYS` | Leave empty for process-local persistence and dispatch. |
+| `UPLOADS_ENABLED`, `OPENSEARCH_*`, `CLAMAV_*`, `UPLOAD_ARTIFACT_ROOT` | Private-document ingestion and retrieval; nothing is constructed while uploads are disabled. |
+
+[`config/models.yaml`](config/models.yaml) maps each agent role to an ordered list of targets.
+Every target allows 16k output tokens with a 4-to-5-minute timeout: deep-depth plans, syntheses,
+and reviews are large structured documents, and a smaller ceiling makes the model stop mid-output
+(`model_output_limit`). Report targets get the longest timeout.
+
+---
+
+## HTTP API
+
+Run control plane (every mutating request needs an `Idempotency-Key` header of 8–200
+characters; reusing a key for the same command replays the original response, reusing it for
+different input returns `409`):
+
+```text
+POST /v1/runs                          create (topic, depth, safe upload metadata)
+POST /v1/runs/{run_id}/start           enqueue the clarifier
+GET  /v1/runs/{run_id}                 run record with checkpoint summary and budget usage
+POST /v1/runs/{run_id}/clarifications  {"round_number": 1, "answers": [{"question_id": …, "value": …}]}
+PUT  /v1/runs/{run_id}/plan            save a replacement plan version (new hash) for approval
+POST /v1/runs/{run_id}/plan/approve    {"version": 1, "content_hash": "<sha256>"}  (exact match or 409)
+POST /v1/runs/{run_id}/cancel          cooperative cancellation
+GET  /v1/runs/{run_id}/events?after=N  cursor-based, replayable, safe metadata only
+GET  /v1/runs/{run_id}/report          text/markdown once COMPLETED, 409 before
+```
+
+Agent debug endpoints (`POST /v1/clarifier/evaluate`, `/v1/planner/generate`,
+`/v1/researcher/research`, `/v1/reviewer/review`, `/v1/report/generate`,
+`/v1/questions/generate`) exist only when `create_app` is given an explicit gateway or
+`expose_agent_debug_routes=True`; the production app never constructs agents in the request
+process.
+
+Deployment shape: `deep-research-dev` runs API and worker in one process on shared in-memory
+adapters. Production separates `deep_research.api.app:app` from `deep-research-worker`, which
+require `SQS_JOBS_QUEUE_URL` and `DYNAMODB_RUNS_TABLE` (single table, `PK`/`SK` string keys,
+numeric `expires_at` TTL, conditional transactional writes). The full AWS design (AgentCore
+Runtime, S3 artifacts, OpenSearch Serverless, Cognito, OpenTelemetry) is in the
+[architecture plan](arch_plan/deep-research-system-plan.md).
+
+---
+
+## Testing
+
+```bash
+pytest            # mocked: 162 deterministic tests, no credentials, ~4 s
+pytest -m live    # opt-in: calls the configured model, Tavily, and the public web
+ruff check src tests
+```
+
+The mocked suite fakes the model gateway and research adapters and covers each agent's
+validation and repair paths, evidence merging, the page cache (including cancellation and
+garbage-collection behavior), SSRF guard caching, worker failure classification, checkpoint
+resumption, budget clamping, control-plane transitions and idempotency, Cognito verification,
+upload ingestion, and the CLI's interactive and non-interactive paths.
+
+The live suite uses quick budgets and covers every model role, provider routing, Tavily followed
+by Playwright, clarification resume, exact approval, cancellation during research, and a complete
+public-web workflow with citation resolution. Missing credentials cause clean skips.
+
+---
 
 ## Troubleshooting
 
-- **Provider credential error at startup:** Confirm `MODEL_PROVIDER` matches the populated key.
-  Blank values are treated as missing. For Bedrock, verify `aws sts get-caller-identity` succeeds in
-  the same shell. Fallbacks are opt-in through `MODEL_FALLBACK_ORDER`.
-- **OpenAI authentication error:** Check that `OPENAI_API_KEY` is a server-side API key available to
-  the selected project and that `OPENAI_MODEL_ID` is enabled for it. The key is never sent in model
-  prompts or logged.
-- **Chromium executable missing:** Run `playwright install chromium` inside the active virtual
-  environment. On Linux, Playwright may also require its documented system dependencies.
-- **Structured-output failure:** Confirm the chosen model supports the configured Strands
-  structured-output path. Inspect the safe role/provider/model log (`--verbose`) and select
-  another accessible model ID; invalid model output receives one bounded repair attempt, after
-  which the researcher drops the invalid claims and the report agent trims or falls back rather
-  than failing the run.
-- **Run failed with `model_output_limit`:** the model stopped at its `max_tokens` ceiling. Raise
-  `max_tokens` (and `timeout_seconds`) for that target in `config/models.yaml`; the run is not
-  retried because the same prompt would hit the same ceiling.
-- **Run failed with `model_provider_rejected`:** the provider refused the request for a reason
-  that will not change on retry, most often an exhausted credit balance or an invalid key. The
-  failure message carries the provider's text. Top up or fix the key and start a new run; nothing
-  was redelivered, so no search or fetch budget was re-spent.
-- **Run failed with `worker_validation_error`:** an agent's output or a checkpoint failed a
-  deterministic check on the first delivery. The message names the check; it is a code or prompt
-  issue, not a transient one.
-- **Run failed with `insufficient_evidence`:** no workstream produced an evidence-backed claim,
-  so there is nothing to report. Check the printed limitations for fetch failures (timeouts, 403s,
-  paywalls) and broaden the topic or fix connectivity.
-- **Report says it was "assembled deterministically":** the model's prose draft failed a hard
-  citation or outline check twice, so the report was built directly from reviewed claims. It is
-  complete and fully cited but reads as a claim list per section. See [Sample reports](#sample-reports).
-- **Tavily 401/403 or empty discovery:** Verify `TAVILY_API_KEY`, account quota, and outbound HTTPS.
-  Search snippets are intentionally not accepted as evidence; Playwright must fetch a public page.
-- **Public URL rejected:** The SSRF guard rejects credentials in URLs, nonstandard ports, redirects
-  to private networks, localhost, and link-local addresses. This protection is not configurable.
-- **Upload configuration failure:** Public-web mode intentionally uses `UPLOADS_ENABLED=false`. An
-  approved upload workstream fails clearly until OpenSearch and the upload ingestion services are
-  explicitly configured.
-- **Run vanished after restart:** the default in-memory repository is process-local. Configure the
-  existing DynamoDB/SQS production adapters when cross-process durability is required.
+- **Provider credential error at startup**: `MODEL_PROVIDER` must match the populated key; blank
+  values count as missing. For Bedrock, `aws sts get-caller-identity` must succeed in the same
+  shell.
+- **Chromium executable missing**: run `playwright install chromium` inside the active venv.
+- **`model_output_limit`**: raise `max_tokens` and `timeout_seconds` for that target in
+  `config/models.yaml`. The run is not retried because the same prompt would hit the same
+  ceiling.
+- **`model_provider_rejected`**: the provider refused for a reason retrying will not change,
+  usually an exhausted credit balance or an invalid key; the message carries the provider's
+  text. Nothing was redelivered, so no search or fetch budget was re-spent.
+- **`worker_validation_error`**: an agent's output or a checkpoint failed a deterministic check
+  on the first delivery; the message names the check.
+- **`insufficient_evidence`**: no workstream produced an evidence-backed claim. Check the printed
+  limitations for fetch failures (timeouts, 403s, paywalls) and broaden the topic.
+- **Report says "assembled deterministically"**: the model's prose failed a hard citation or
+  outline check twice, so the report was built from reviewed claims. See
+  [Sample reports](#sample-reports).
+- **Tavily 401/403 or empty discovery**: verify `TAVILY_API_KEY`, quota, and outbound HTTPS.
+- **Public URL rejected**: the SSRF guard is not configurable by design.
+- **Run vanished after restart**: the default in-memory repository is process-local; configure
+  DynamoDB and SQS for cross-process durability.
 
-## Worker and dispatch
+---
 
-Starting a run, completing clarification, and approving a plan enqueue typed phase jobs. The
-worker executes one bounded graph phase per delivery and checkpoints before the approval interrupt
-and after every completed outer node or research workstream. A replacement worker resumes from the
-canonical checkpoint; duplicate Standard-queue delivery is safe through optimistic revisions and
-node-scoped idempotency keys.
-
-Without `SQS_JOBS_QUEUE_URL`, dispatch uses an in-memory acknowledged queue. Use
-`deep-research-dev` so API and worker share it. Separate production processes require SQS plus
-DynamoDB and use `deep-research-worker`.
-
-The production API does not construct or expose agents. Direct agent endpoints are available only
-when `create_app` receives an explicit gateway (or `expose_agent_debug_routes=True`) for isolated
-development tests.
-
-## Agent debug endpoints
+## Project layout
 
 ```text
-POST /v1/clarifier/evaluate
-POST /v1/planner/generate
-POST /v1/researcher/research
-POST /v1/questions/generate
-POST /v1/reviewer/review
-POST /v1/report/generate
+src/deep_research/
+  agents/          clarifier, planner, researcher, reviewer, report, questions (+ cancellation)
+  contracts/       Pydantic contracts: clarification, planning, research, evidence, reporting,
+                   questions, runs, jobs, orchestration checkpoint
+  orchestration/   bounded Strands GraphBuilder topology
+  worker.py        DurableWorker: phase handlers, checkpoints, budget accounting, failure classes
+  services/runs.py RunControlService: lifecycle, idempotency, events, approval hashing
+  persistence/     in-memory and DynamoDB run repositories
+  jobs/            in-memory and SQS phase-job dispatchers
+  models/          YAML-routed multi-provider ModelGateway with structured output
+  tools/           Tavily search, Playwright fetcher with SSRF guard, page cache, URL canon.
+  uploads/         ingestion pipeline and OpenSearch retrieval
+  auth/            Cognito token verification and development identity
+  api/             FastAPI application and routes
+  cli.py           interactive / unattended local runner
+  dev_app.py       single-process API + worker composition
+tests/             162 mocked tests; tests/live/ opt-in live suite
+config/models.yaml role → provider target routing
+arch_plan/         the design document the implementation follows
+reports/           two committed sample reports (other output is git-ignored)
 ```
 
-## Run control plane
+About 9,500 lines of application code and 5,000 lines of tests.
 
-```text
-POST /v1/runs
-GET  /v1/runs/{run_id}
-POST /v1/runs/{run_id}/start
-POST /v1/runs/{run_id}/clarifications
-PUT  /v1/runs/{run_id}/plan
-POST /v1/runs/{run_id}/plan/approve
-POST /v1/runs/{run_id}/cancel
-GET  /v1/runs/{run_id}/events?after={cursor}
-GET  /v1/runs/{run_id}/report
-```
+---
 
-Every mutating request requires an `Idempotency-Key` header of 8–200 characters. Reusing a key for
-the same command returns the original response; reusing it for different input returns `409`.
-Plan approval requires the exact current plan version and canonical SHA-256 hash. Lifecycle updates
-atomically persist the new run revision, one immutable ordered event, and the idempotency response.
-Event polling accepts a cursor so clients can reconnect without losing progress. Worker events
-contain only safe phase metadata, checksums, counts, and budget totals—not prompts or evidence text.
-The report endpoint returns `text/markdown` only after completion, returns `409` while not ready,
-and uses the same owner/tenant authorization as every other run endpoint.
+## Roadmap
 
-The clarification endpoint accepts the checkpointed round and typed answers, for example
-`{"round_number":1,"answers":[{"question_id":"audience","value":"Engineering leaders"}]}`.
-Pending questions, the proposed brief, submitted answers, and the round are checkpointed before
-each interrupt. Unknown/stale questions, duplicate answers, omitted required answers, and values of
-the wrong answer type return `409`. A replay with the same idempotency key is safe.
-
-Without `DYNAMODB_RUNS_TABLE`, runs use process-local memory for development and tests. When the
-table is configured, the repository uses one DynamoDB table with string partition/sort keys named
-`PK` and `SK`, plus a numeric `expires_at` TTL attribute. Enable DynamoDB TTL on `expires_at`.
-Conditional transactional writes enforce revision and event ordering. The application does not
-create the table; infrastructure remains the CDK layer's responsibility.
-
-The request carries the topic, safe upload metadata, previous answers, current normalized brief,
-and clarification round. The response is always a validated `ClarificationDecision`; the endpoint
-does not expose public-web or retrieval tools.
-
-The planning endpoint accepts an approved brief, depth preset, upload metadata, edits, and an
-optional previous plan. Budget ceilings, version, and content hash are application-controlled. The
-questions endpoint accepts a compact completed-report context and returns five to ten suggestions;
-it never starts a new run.
-
-The reviewer result is bound to hashes of the exact plan and evidence package. Repair tasks cannot
-exceed the plan's remaining query or retry budget. The report endpoint accepts only a non-repair
-review for those same inputs, rejects invented or unmapped citations, and omits unsafe Mermaid after
-one repair attempt while retaining a prose fallback.
-
-## Research adapter boundary
-
-`ResearchAgent` never receives credentials, tenant IDs, index clients, or browser sessions from the
-model. A run-bound `ResearchAdapter` supplies three typed capabilities: `search_web`, `fetch_page`,
-and `search_uploads`. The default API application adapter remains deliberately unconfigured because
-research execution belongs in a durable worker, not the API request process. That worker should call
-`build_live_research_services(settings, tenant_id=..., run_id=...)` only after ownership and exact
-plan approval have been verified.
-
-The public-web bundle uses Tavily for discovery and an isolated Playwright Chromium context for
-opened-page evidence. With `UPLOADS_ENABLED=false`, it does not construct OpenSearch, ClamAV, S3,
-DynamoDB, or SQS services. If an approved plan nevertheless requests upload search, the run fails
-with a typed configuration error instead of broadening its scope. When uploads are explicitly
-enabled, a tenant/run-filtered OpenSearch adapter is constructed lazily. Tavily snippets remain
-discovery metadata. The Playwright adapter revalidates public HTTP(S) destinations, blocks local and
-private network requests, limits redirects and response sizes, and extracts rendered HTML or public
-PDF text. OpenSearch supports local basic authentication and AWS SigV4 for Serverless (`aoss`).
-
-Search results are discovery metadata only. Public evidence must pass through `fetch_page`, while
-upload search returns bounded chunks with preserved document locations. Parallel workstream results
-are combined with `merge_research_results` before constructing a `ReviewerRequest`.
-
-## Upload ingestion and retrieval
-
-`UploadIngestionService` is the post-upload processing boundary. The browser-facing presigned-upload
-API is intentionally not exposed yet because the S3 upload authorization and quarantine-event
-workflow are not implemented. Once an authenticated API or worker has the bytes, ingestion is:
-
-1. Write the original into a tenant/run-scoped quarantine location.
-2. Enforce the 25 MB limit and validate extension, declared MIME type, and magic/archive structure.
-3. Stream the bytes to ClamAV. Scanner failure or an indeterminate result fails closed.
-4. Parse PDF pages, DOCX paragraphs/headings, or UTF-8 TXT/Markdown line blocks.
-5. Create overlapping, location-preserving chunks with stable content hashes.
-6. Store the private original and extracted chunk artifact separately with local `0600` permissions.
-7. Replace that upload's index entries and write chunks to OpenSearch with server-injected
-   `tenant_id` and `run_id` fields.
-8. At research time, inject those same identity filters into every query and return only bounded
-   `UploadChunk` excerpts and coordinates to the Research Agent.
-
-The local artifact store mirrors the planned quarantine/original/extracted prefixes. Production S3
-storage and presigned upload endpoints remain part of the persistence/authentication workstream; the
-parsing and index contracts do not need to change when that store is added.
+- Presigned S3 upload endpoints and the quarantine-event workflow (ingestion and retrieval are
+  implemented; the browser-facing upload API is not).
+- Server-Sent Events on top of the existing cursor-based event log.
+- Plan editing from the CLI (the API supports `PUT /plan`; the CLI currently approves or cancels).
+- Cross-run fetch caching and per-workstream source de-duplication in budget accounting.
+- Prompt work so the model's prose draft clears the citation gate more often; the deterministic
+  fallback is correct but reads as a claim list.
+- PDF export and rendered diagram artifacts.
